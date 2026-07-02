@@ -8,7 +8,6 @@
 // @grant        GM_xmlhttpRequest
 // @grant        GM_getValue
 // @grant        GM_setValue
-// @grant        unsafeWindow
 // @connect      api.torn.com
 // @connect      torn-kgyr.onrender.com
 // @run-at       document-idle
@@ -93,25 +92,20 @@
         const style = document.createElement('style');
         style.id = 'iq-styles';
         style.textContent = `
-            #iq-overlay-layer {
-                position: fixed;
-                top: 0;
-                left: 0;
-                width: 0;
-                height: 0;
-                z-index: 99998;
-            }
             .iq-call-btn {
                 all: unset !important;
                 box-sizing: border-box !important;
-                position: fixed !important;
+                position: absolute !important;
+                top: 50% !important;
+                right: calc(100% + 6px) !important;
+                transform: translateY(-50%) !important;
                 display: inline-flex !important;
                 align-items: center !important;
                 justify-content: center !important;
-                z-index: 99998 !important;
+                z-index: 10 !important;
                 padding: 2px 7px !important;
                 min-width: 40px !important;
-                width: auto !important;
+                width: max-content !important;
                 max-width: none !important;
                 height: 18px !important;
                 font-family: Arial, sans-serif !important;
@@ -132,19 +126,14 @@
                 color: #fff !important;
                 box-shadow: 0 1px 4px rgba(0,0,0,0.5), inset 0 1px 0 rgba(255,255,255,0.25) !important;
                 text-shadow: 0 1px 1px rgba(0,0,0,0.5) !important;
-                transition: background 0.15s ease, opacity 0.15s ease, transform 0.1s ease !important;
-                vertical-align: middle !important;
+                transition: background 0.15s ease, opacity 0.15s ease !important;
                 white-space: nowrap !important;
             }
-            .iq-call-btn.iq-hidden {
-                visibility: hidden !important;
-                pointer-events: none !important;
+            .iq-call-btn:active:not(:disabled) {
+                transform: translateY(-50%) translateY(1px) !important;
             }
             .iq-call-btn:hover:not(:disabled) {
                 background: linear-gradient(180deg, #6fdf6f 0%, #4aaa4a 60%, #358a35 100%) !important;
-            }
-            .iq-call-btn:active:not(:disabled) {
-                transform: translateY(1px) !important;
             }
             .iq-call-btn.iq-mine {
                 background: linear-gradient(180deg, #ffcf5f 0%, #d99a2a 60%, #a8710f 100%) !important;
@@ -167,23 +156,32 @@
                 font-size: 11px !important;
                 padding: 3px 9px !important;
             }
-
-            #iq-tooltip {
-                position: fixed;
-                transform: translate(-50%, -100%);
-                background: #16171b;
-                color: #eee;
-                padding: 4px 9px;
-                border: 1px solid rgba(255,255,255,0.12);
-                border-radius: 4px;
-                font-family: Arial, sans-serif;
-                font-size: 11px;
-                white-space: nowrap;
-                pointer-events: none;
-                z-index: 100001;
-                opacity: 0;
-                transition: opacity 0.1s ease;
-                box-shadow: 0 4px 14px rgba(0,0,0,0.5);
+            .iq-call-btn .iq-tooltip {
+                all: unset !important;
+                position: absolute !important;
+                bottom: calc(100% + 6px) !important;
+                left: 50% !important;
+                transform: translateX(-50%) !important;
+                display: block !important;
+                background: #16171b !important;
+                color: #eee !important;
+                padding: 4px 9px !important;
+                border: 1px solid rgba(255,255,255,0.12) !important;
+                border-radius: 4px !important;
+                font-family: Arial, sans-serif !important;
+                font-size: 11px !important;
+                font-weight: 400 !important;
+                text-transform: none !important;
+                letter-spacing: normal !important;
+                white-space: nowrap !important;
+                pointer-events: none !important;
+                z-index: 20 !important;
+                opacity: 0 !important;
+                transition: opacity 0.1s ease !important;
+                box-shadow: 0 4px 14px rgba(0,0,0,0.5) !important;
+            }
+            .iq-call-btn:hover .iq-tooltip {
+                opacity: 1 !important;
             }
 
             #iq-launcher {
@@ -509,98 +507,68 @@
         });
     }
 
-    // ---- Overlay badges over Torn's native war page ----
+    // ---- Badges anchored inside Torn's native war page ----
     //
     // Every attackable enemy member on the war page renders a real Torn link
     // like `page.php?sid=attack&user2ID=12345`. We anchor off that link (a
     // stable, functional URL — not a hashed CSS-module class name Torn could
     // rename on any deploy).
     //
-    // Earlier this inserted the O/X badge as a new DOM child next to that
-    // link. Torn's war list is a React component that re-renders itself on
-    // its own polling cycle; a foreign node left inside a subtree React
-    // thinks it fully owns makes its next reconciliation pass throw, which
-    // is what was silently wiping out the other faction's list. To avoid
-    // touching Torn's DOM structurally at all, badges live in a layer we own
-    // completely (appended straight to <body>) and are just visually
-    // positioned on top of each Attack link via getBoundingClientRect — we
-    // only ever *read* Torn's DOM, never mutate it.
+    // Two earlier approaches both fought coordinate math: inserting the
+    // button in-flow made it count toward the row's flex width (pushing the
+    // other faction's column below once the row overflowed), and a
+    // getBoundingClientRect-based floating overlay broke the moment
+    // something in Torn's page changed the containing block for
+    // position:fixed elements. This version sidesteps both: the badge is a
+    // real child of the Attack column, but `position: absolute` pulls it out
+    // of flex flow (zero footprint on layout, can't push anything), and it's
+    // placed with pure CSS (`right: 100%` of its own column) instead of any
+    // JS-computed pixel coordinates — nothing to get wrong.
 
     const ATTACK_HREF_RE = /(?:user2ID|XID)=(\d+)/;
-    const badgesByLink = new Map(); // <a> element -> its overlay badge
     const callSeenAt = {}; // callId -> first time we observed it (for the "called Xs ago" fallback)
-    let overlayLayer = null;
-    let repositionQueued = false;
 
     function findAttackLinks() {
         return Array.from(document.querySelectorAll('a[href*="sid=attack"]'));
     }
 
-    function ensureOverlayLayer() {
-        if (overlayLayer && document.body.contains(overlayLayer)) return overlayLayer;
-        overlayLayer = document.createElement('div');
-        overlayLayer.id = 'iq-overlay-layer';
-        document.body.appendChild(overlayLayer);
-        return overlayLayer;
-    }
-
-    // Some Attack "links" are just a hit-target wrapping an icon/child element
-    // (e.g. styled with display:contents), so the <a> itself reports a 0x0
-    // box — fall back to a child's box in that case instead of hiding the
-    // badge at (0,0), which is what was making it vanish.
-    function measureRect(el) {
-        if (!el) return null;
-        const rect = el.getBoundingClientRect();
-        if (rect.width || rect.height) return rect;
-        const child = el.querySelector('*');
-        return child ? child.getBoundingClientRect() : rect;
-    }
-
     // Walk up from the Attack link to whichever ancestor is a direct child of
-    // the row (i.e. the Attack column itself), purely to *read* its position
-    // and its previous sibling's (the Status column) — no DOM writes here.
-    function locateColumns(link) {
+    // the row — i.e. the Attack column itself — so the badge can anchor to
+    // that column instead of squeezing inside it.
+    function findAttackColumn(link) {
         const row = link.closest('li') || link.parentElement;
-        if (!row) return { attackRect: measureRect(link), statusRect: null };
+        if (!row) return link;
         let col = link;
         while (col.parentElement && col.parentElement !== row) col = col.parentElement;
-        const attackCol = col.parentElement === row ? col : link;
-        const statusCol = attackCol.previousElementSibling;
-        return {
-            attackRect: measureRect(attackCol),
-            statusRect: statusCol ? measureRect(statusCol) : null,
-        };
+        return col.parentElement === row ? col : link;
     }
 
-    function positionBadge(link, badge) {
-        const { attackRect, statusRect } = locateColumns(link);
-        if (!attackRect || (attackRect.width === 0 && attackRect.height === 0)) {
-            badge.classList.add('iq-hidden');
-            return;
-        }
-        badge.classList.remove('iq-hidden');
-        const bw = badge.offsetWidth || 46;
-        const bh = badge.offsetHeight || 18;
-        const centerX = (statusRect && statusRect.width)
-            ? (statusRect.right + attackRect.left) / 2
-            : attackRect.left - bw / 2 - 6;
-        badge.style.left = `${Math.round(centerX - bw / 2)}px`;
-        badge.style.top = `${Math.round(attackRect.top + attackRect.height / 2 - bh / 2)}px`;
-    }
-
-    function scheduleReposition() {
-        if (repositionQueued) return;
-        repositionQueued = true;
-        requestAnimationFrame(() => {
-            repositionQueued = false;
-            badgesByLink.forEach((badge, link) => positionBadge(link, badge));
-            if (tooltipTarget) positionTooltip(tooltipTarget);
+    function createBadge(memberId) {
+        const badge = document.createElement('button');
+        badge.type = 'button';
+        badge.className = 'iq-call-btn';
+        badge.dataset.id = memberId;
+        badge.addEventListener('click', (e) => {
+            e.preventDefault();
+            e.stopPropagation();
+            handleCallClick(badge.dataset.id);
         });
+
+        const label = document.createElement('span');
+        label.className = 'iq-label';
+        badge.appendChild(label);
+
+        const tip = document.createElement('span');
+        tip.className = 'iq-tooltip';
+        badge.appendChild(tip);
+        badge.addEventListener('mouseenter', () => startTooltipTicker(badge, tip));
+        badge.addEventListener('mouseleave', stopTooltipTicker);
+
+        return badge;
     }
 
     function scanAndInject() {
         if (!state.enemyFactionId) return;
-        const layer = ensureOverlayLayer();
 
         findAttackLinks().forEach((link) => {
             const href = link.getAttribute('href') || '';
@@ -608,31 +576,17 @@
             if (!match) return;
             const memberId = match[1];
 
-            let badge = badgesByLink.get(link);
+            const column = findAttackColumn(link);
+            if (getComputedStyle(column).position === 'static') {
+                column.style.position = 'relative';
+            }
+
+            let badge = column.querySelector(':scope > .iq-call-btn');
             if (!badge) {
-                badge = document.createElement('button');
-                badge.type = 'button';
-                badge.className = 'iq-call-btn';
-                badge.addEventListener('click', (e) => {
-                    e.preventDefault();
-                    e.stopPropagation();
-                    handleCallClick(badge.dataset.id);
-                });
-                attachTooltip(badge);
-                layer.appendChild(badge);
-                badgesByLink.set(link, badge);
+                badge = createBadge(memberId);
+                column.appendChild(badge);
             }
             badge.dataset.id = memberId;
-            positionBadge(link, badge);
-        });
-
-        // Torn re-renders rows (new tab, pagination, live status updates) which
-        // replaces the underlying <a> nodes — drop badges whose link is gone.
-        badgesByLink.forEach((badge, link) => {
-            if (!document.body.contains(link)) {
-                badge.remove();
-                badgesByLink.delete(link);
-            }
         });
 
         refreshButtonStates();
@@ -647,39 +601,31 @@
             if (!state.calls.some((c) => String(c.id) === id)) delete callSeenAt[id];
         });
 
-        badgesByLink.forEach((btn) => {
+        document.querySelectorAll('.iq-call-btn').forEach((btn) => {
             const id = btn.dataset.id;
             const call = callsByMember.get(id);
+            const label = btn.querySelector('.iq-label');
             btn.classList.remove('iq-mine', 'iq-other');
             if (call) {
                 const isMine = String(call.callerId) === String(state.playerId);
                 btn.classList.add(isMine ? 'iq-mine' : 'iq-other');
-                btn.textContent = isMine ? 'Uncall' : 'Called';
+                label.textContent = isMine ? 'Uncall' : 'Called';
                 btn.disabled = !isMine;
             } else {
-                btn.textContent = 'Call';
+                label.textContent = 'Call';
                 btn.disabled = false;
             }
         });
     }
 
-    // ---- Custom tooltip with a live countdown ----
+    // ---- Tooltip with a live countdown ----
     //
-    // Native `title` tooltips are static text — they can't tick down while
-    // held open. This is a small floating element we update on an interval
-    // for as long as the mouse stays over a badge.
+    // Shown/hidden with pure CSS (:hover), nested inside the badge so it
+    // inherits the same anchoring — no coordinates computed in JS at all.
+    // JS only handles ticking the text once a second while it's visible,
+    // since a live countdown needs updates a static `title` can't give.
 
-    let tooltipEl = null;
     let tooltipTimer = null;
-    let tooltipTarget = null;
-
-    function ensureTooltipEl() {
-        if (tooltipEl && document.body.contains(tooltipEl)) return tooltipEl;
-        tooltipEl = document.createElement('div');
-        tooltipEl.id = 'iq-tooltip';
-        document.body.appendChild(tooltipEl);
-        return tooltipEl;
-    }
 
     function tooltipTextFor(badge) {
         const id = badge.dataset.id;
@@ -704,39 +650,22 @@
         return base;
     }
 
-    function positionTooltip(badge) {
-        const tip = ensureTooltipEl();
-        const rect = badge.getBoundingClientRect();
-        tip.style.left = `${Math.round(rect.left + rect.width / 2)}px`;
-        tip.style.top = `${Math.round(rect.top - 6)}px`;
-    }
-
-    function attachTooltip(badge) {
-        badge.addEventListener('mouseenter', () => {
-            tooltipTarget = badge;
-            const tip = ensureTooltipEl();
+    function startTooltipTicker(badge, tip) {
+        tip.textContent = tooltipTextFor(badge);
+        if (tooltipTimer) clearInterval(tooltipTimer);
+        tooltipTimer = setInterval(() => {
+            if (!document.body.contains(badge)) {
+                clearInterval(tooltipTimer);
+                return;
+            }
             tip.textContent = tooltipTextFor(badge);
-            positionTooltip(badge);
-            tip.style.opacity = '1';
-            if (tooltipTimer) clearInterval(tooltipTimer);
-            tooltipTimer = setInterval(() => {
-                if (tooltipTarget !== badge || !document.body.contains(badge)) {
-                    clearInterval(tooltipTimer);
-                    return;
-                }
-                tip.textContent = tooltipTextFor(badge);
-                positionTooltip(badge);
-            }, 1000);
-        });
-        badge.addEventListener('mouseleave', () => {
-            if (tooltipTimer) clearInterval(tooltipTimer);
-            tooltipTarget = null;
-            if (tooltipEl) tooltipEl.style.opacity = '0';
-        });
+        }, 1000);
     }
 
-    document.addEventListener('scroll', scheduleReposition, true);
-    window.addEventListener('resize', scheduleReposition);
+    function stopTooltipTicker() {
+        if (tooltipTimer) clearInterval(tooltipTimer);
+        tooltipTimer = null;
+    }
 
     // ---- Launcher + status widget ----
 
@@ -862,31 +791,6 @@
             checkAutoUncall();
         }, 1500);
     }
-
-    // Run __iqDebug() in the browser console on the war page to dump the
-    // real measurements for every badge — paste the output back so the
-    // positioning logic can be fixed against actual numbers instead of
-    // another guess at Torn's markup.
-    const pageWindow = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
-    pageWindow.__iqDebug = window.__iqDebug = function () {
-        const rows = findAttackLinks().map((link) => {
-            const row = link.closest('li') || link.parentElement;
-            const { attackRect, statusRect } = locateColumns(link);
-            return {
-                href: link.getAttribute('href'),
-                linkRect: link.getBoundingClientRect(),
-                attackRect,
-                statusRect,
-                rowTag: row && row.tagName,
-                rowClass: row && row.className,
-                rowOuterHTML: row ? row.outerHTML.slice(0, 400) : null,
-            };
-        });
-        console.log('[InQuest debug] bodyTransform:', getComputedStyle(document.body).transform);
-        console.log('[InQuest debug] htmlTransform:', getComputedStyle(document.documentElement).transform);
-        console.log('[InQuest debug] rows:', rows);
-        return rows;
-    };
 
     async function init() {
         injectStyles();
