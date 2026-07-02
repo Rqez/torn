@@ -216,6 +216,26 @@
     return text || "Member";
   }
 
+  function truncateName(name, maxLen = 8) {
+    if (!name) return "";
+    return name.length > maxLen ? name.slice(0, maxLen) + "…" : name;
+  }
+
+  // Torn re-renders the header row (containing div.member / div.level /
+  // div.points / div.status) as a sibling of ul.members-list, not inside it —
+  // see get_sorted_column() above, which relies on the same structure.
+  function ensure_called_header(ul) {
+    const header = ul.parentNode;
+    if (!header) return;
+    if (header.querySelector(".twse-calledby-header")) return;
+    const statusHeader = header.querySelector("div.status");
+    if (!statusHeader) return;
+    const cell = document.createElement("div");
+    cell.className = "twse-calledby-header";
+    cell.textContent = "Called";
+    statusHeader.insertAdjacentElement("afterend", cell);
+  }
+
   function renderCallUI() {
     member_lis.forEach((entry, memberId) => {
       const li = entry.li;
@@ -223,111 +243,151 @@
       if (!entry.div) return;
 
       // extract_all_member_lis() rebuilds `entry` objects (and clears the
-      // Map) whenever the war panel re-renders, but any badge we already
+      // Map) whenever the war panel re-renders, but any cell we already
       // inserted is still physically in the DOM. Reconcile against the DOM
       // itself, not just the in-memory reference, so we never end up with
-      // more than one badge per row.
-      const existingBadges = entry.div.querySelectorAll(
-        ":scope > .twse-call-badge",
-      );
-      let badge = null;
-      existingBadges.forEach((el, idx) => {
+      // more than one per row.
+      const existingCells = li.querySelectorAll(".twse-calledby");
+      let cell = null;
+      existingCells.forEach((el, idx) => {
         if (idx === 0) {
-          badge = el;
+          cell = el;
         } else {
           el.remove();
         }
       });
-      if (!badge) {
-        badge = document.createElement("div");
-        badge.className = "twse-call-badge";
-        entry.div.appendChild(badge);
+      if (!cell) {
+        cell = document.createElement("div");
+        cell.className = "twse-calledby";
+        entry.div.insertAdjacentElement("afterend", cell);
       }
-      entry.callBadge = badge;
+      entry.calledByCell = cell;
 
       const call = calls.get(memberId);
-      badge.innerHTML = "";
+      cell.classList.remove("twse-callable", "twse-mine", "twse-other");
+      cell.onclick = null;
 
       if (!call) {
-        const btn = document.createElement("button");
-        btn.className = "twse-call-btn";
-        btn.textContent = "Call";
-        btn.onclick = () => submitCall(memberId, getMemberDisplayName(li));
-        badge.appendChild(btn);
+        cell.textContent = "";
+        cell.title = "Click to call this target";
+        cell.classList.add("twse-callable");
+        cell.onclick = () => submitCall(memberId, getMemberDisplayName(li));
         return;
       }
 
       const isMine =
         callerPlayerId && String(call.callerId) === String(callerPlayerId);
-
-      const label = document.createElement("span");
-      label.className = isMine
-        ? "twse-call-label twse-call-mine"
-        : "twse-call-label twse-call-other";
-      label.textContent = isMine
-        ? "Called by you"
-        : `Called by ${call.callerName || "?"}`;
-      badge.appendChild(label);
+      cell.textContent = truncateName(call.callerName);
+      cell.title = call.callerName || "";
 
       if (isMine) {
-        const btn = document.createElement("button");
-        btn.className = "twse-call-btn twse-uncall-btn";
-        btn.textContent = "Uncall";
-        btn.onclick = () => cancelCall(call.id, memberId);
-        badge.appendChild(btn);
+        cell.classList.add("twse-mine");
+        cell.title += " (click to uncall)";
+        cell.onclick = () => cancelCall(call.id, memberId);
+      } else {
+        cell.classList.add("twse-other");
       }
     });
   }
 
+  // Torn shows the score with 2 decimals (e.g. "0.00"), which the base
+  // script's own hidden-text-via-::after technique (see div.status below)
+  // isn't applied to. Reuse the same trick here: hide the real text and
+  // render a rounded version through a CSS custom property, so we never
+  // touch/replace the underlying DOM node React manages.
+  function format_score_cells() {
+    member_lis.forEach((entry) => {
+      const li = entry.li;
+      if (!li || !li.isConnected) return;
+      const pointsDiv = li.querySelector("div.points");
+      if (!pointsDiv) return;
+      const raw = pointsDiv.textContent.trim();
+      const match = raw.match(/^(-?[\d,]+)(?:\.\d+)?$/);
+      const rounded = match ? match[1] : raw;
+      pointsDiv.style.setProperty("--twse-points-content", `"${rounded}"`);
+    });
+  }
+
   GM_addStyle(`
-.members-list div.status {
-  /* The badge below is a child of this element and absolutely positioned
-     just past its bottom edge — make sure it isn't clipped. */
-  overflow: visible !important;
+/* Shrink Level + Score columns (both header and per-row cells share these
+   class names) to make room for the Called By column without widening the
+   row overall. */
+#faction_war_list_id div.level,
+#faction_war_list_id div.points {
+  flex: 0 0 34px !important;
+  width: 34px !important;
+  max-width: 34px !important;
+  min-width: 34px !important;
+  overflow: hidden !important;
 }
-.twse-call-badge {
-  display: inline-flex;
+
+/* Round the per-row score display to a whole number (header text is left
+   alone — this only targets score cells that live inside a member row). */
+#faction_war_list_id li div.points {
+  color: transparent !important;
+  position: relative !important;
+}
+#faction_war_list_id li div.points::after {
+  content: var(--twse-points-content);
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  display: flex;
   align-items: center;
-  gap: 4px;
-  margin-left: 6px;
+  justify-content: center;
+  color: inherit;
+}
+
+.twse-calledby-header {
+  flex: 0 0 64px !important;
+  width: 64px !important;
+  max-width: 64px !important;
+  display: flex;
+  align-items: center;
+  justify-content: center;
   font-size: 10px;
+  text-transform: uppercase;
+  color: #ccc;
+  padding: 0 2px;
+}
+.twse-calledby {
+  flex: 0 0 64px !important;
+  width: 64px !important;
+  max-width: 64px !important;
+  overflow: hidden;
+  text-overflow: ellipsis;
   white-space: nowrap;
-  vertical-align: middle;
-}
-.twse-call-btn {
-  background: #333;
-  color: #eee;
-  border: 1px solid #555;
-  border-radius: 3px;
-  padding: 1px 6px;
-  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
   font-size: 10px;
-  line-height: 1.4;
-}
-.twse-call-btn:hover {
-  background: #444;
-}
-.twse-uncall-btn {
-  background: #4a7a00;
-  border-color: #6aa900;
-  color: #fff;
-}
-.twse-uncall-btn:hover {
-  background: #5a9a00;
-}
-.twse-call-label {
   font-weight: 600;
+  padding: 0 2px;
 }
-.twse-call-mine {
+.twse-calledby.twse-callable {
+  cursor: pointer;
+  color: #777;
+}
+.twse-calledby.twse-callable:hover {
+  color: #ccc;
+}
+.twse-calledby.twse-mine {
+  cursor: pointer;
   color: #6adb6a;
 }
-.twse-call-other {
-  color: #ffb84d;
-}
-:root .dark-mode .twse-call-mine {
+.twse-calledby.twse-mine:hover {
   color: #8f8;
 }
-:root .dark-mode .twse-call-other {
+.twse-calledby.twse-other {
+  color: #ffb84d;
+  cursor: default;
+}
+:root .dark-mode .twse-calledby.twse-mine {
+  color: #8f8;
+}
+:root .dark-mode .twse-calledby.twse-other {
   color: #ffd08a;
 }
 `);
@@ -780,6 +840,7 @@
   }
 
   function extract_member_lis(ul) {
+    ensure_called_header(ul);
     const lis = ul.querySelectorAll("LI.enemy, li.your");
     lis.forEach((li) => {
       const atag = li.querySelector(`A[href^='/profiles.php']`);
@@ -1143,6 +1204,7 @@
         member_lis.delete(id);
       }
     }
+    format_score_cells();
   }
 
   setInterval(() => {
