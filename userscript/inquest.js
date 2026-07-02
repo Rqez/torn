@@ -1,6 +1,6 @@
 // ==UserScript==
-// @name         Torn War Helper (DIY)
-// @namespace    torn-war-helper
+// @name         InQuest Target Caller
+// @namespace    inquest-target-caller
 // @version      1.0.0
 // @description  Faction war overlay: enemy status list + call/claim coordination, backed by your own sync server
 // @author       you
