@@ -9,7 +9,7 @@
 // @grant        GM_getValue
 // @grant        GM_setValue
 // @connect      api.torn.com
-// @connect      *
+// @connect      torn-kgyr.onrender.com
 // @run-at       document-idle
 // ==/UserScript==
 
