@@ -104,16 +104,16 @@
                 justify-content: center !important;
                 z-index: 10 !important;
                 padding: 2px 7px !important;
-                min-width: 22px !important;
+                min-width: 40px !important;
                 width: max-content !important;
                 max-width: none !important;
                 height: 18px !important;
                 font-family: Arial, sans-serif !important;
-                font-size: 12px !important;
-                font-weight: 800 !important;
+                font-size: 9px !important;
+                font-weight: 700 !important;
                 line-height: 1 !important;
-                text-transform: none !important;
-                letter-spacing: 0 !important;
+                text-transform: uppercase !important;
+                letter-spacing: 0.3px !important;
                 text-align: center !important;
                 text-indent: 0 !important;
                 text-overflow: clip !important;
@@ -136,12 +136,12 @@
                 background: linear-gradient(180deg, #6fdf6f 0%, #4aaa4a 60%, #358a35 100%) !important;
             }
             .iq-call-btn.iq-mine {
-                background: linear-gradient(180deg, #e06a6a 0%, #b53a3a 60%, #7a1f1f 100%) !important;
-                border-color: #4a1010 !important;
+                background: linear-gradient(180deg, #ffcf5f 0%, #d99a2a 60%, #a8710f 100%) !important;
+                border-color: #6b4308 !important;
                 color: #fff !important;
             }
             .iq-call-btn.iq-mine:hover {
-                background: linear-gradient(180deg, #f07a7a 0%, #c54a4a 60%, #8a2f2f 100%) !important;
+                background: linear-gradient(180deg, #ffdf7f 0%, #e9aa3a 60%, #b8811f 100%) !important;
             }
             .iq-call-btn.iq-other {
                 background: linear-gradient(180deg, #e06a6a 0%, #b53a3a 60%, #7a1f1f 100%) !important;
@@ -151,9 +151,9 @@
                 opacity: 0.9 !important;
             }
             body.iq-pda .iq-call-btn {
-                min-width: 28px !important;
+                min-width: 50px !important;
                 height: 24px !important;
-                font-size: 14px !important;
+                font-size: 11px !important;
                 padding: 3px 9px !important;
             }
             .iq-call-btn .iq-tooltip {
@@ -609,10 +609,10 @@
             if (call) {
                 const isMine = String(call.callerId) === String(state.playerId);
                 btn.classList.add(isMine ? 'iq-mine' : 'iq-other');
-                label.textContent = 'X';
+                label.textContent = isMine ? 'Uncall' : 'Called';
                 btn.disabled = !isMine;
             } else {
-                label.textContent = 'O';
+                label.textContent = 'Call';
                 btn.disabled = false;
             }
         });
