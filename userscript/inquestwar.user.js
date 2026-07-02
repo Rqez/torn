@@ -129,7 +129,16 @@
       }
       callerPlayerId = String(data.player_id);
       callerPlayerName = data.name;
-      callerFactionId = data.faction_id ? String(data.faction_id) : null;
+      // Torn's classic /user/?selections=profile nests faction info under
+      // `faction.faction_id`, not a top-level `faction_id` field.
+      const factionId = data.faction?.faction_id ?? data.faction_id ?? null;
+      callerFactionId = factionId ? String(factionId) : null;
+      if (!callerFactionId) {
+        console.warn(
+          "[TornWarStuffEnhanced] Target Caller: could not find a faction_id in the profile response — dumping raw response for debugging:",
+          data,
+        );
+      }
     } catch (e) {
       console.error(
         "[TornWarStuffEnhanced] Target Caller: could not load own profile",
@@ -213,13 +222,28 @@
       if (!li || !li.isConnected || !li.classList.contains("enemy")) return;
       if (!entry.div) return;
 
-      let badge = entry.callBadge;
-      if (!badge || !badge.isConnected) {
+      // extract_all_member_lis() rebuilds `entry` objects (and clears the
+      // Map) whenever the war panel re-renders, but any badge we already
+      // inserted is still physically in the DOM. Reconcile against the DOM
+      // itself, not just the in-memory reference, so we never end up with
+      // more than one badge per row.
+      const existingBadges = entry.div.querySelectorAll(
+        ":scope > .twse-call-badge",
+      );
+      let badge = null;
+      existingBadges.forEach((el, idx) => {
+        if (idx === 0) {
+          badge = el;
+        } else {
+          el.remove();
+        }
+      });
+      if (!badge) {
         badge = document.createElement("div");
         badge.className = "twse-call-badge";
-        entry.div.insertAdjacentElement("afterend", badge);
-        entry.callBadge = badge;
+        entry.div.appendChild(badge);
       }
+      entry.callBadge = badge;
 
       const call = calls.get(memberId);
       badge.innerHTML = "";
@@ -256,6 +280,11 @@
   }
 
   GM_addStyle(`
+.members-list div.status {
+  /* The badge below is a child of this element and absolutely positioned
+     just past its bottom edge — make sure it isn't clipped. */
+  overflow: visible !important;
+}
 .twse-call-badge {
   display: inline-flex;
   align-items: center;
