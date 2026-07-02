@@ -324,6 +324,12 @@
         return { label: raw, color: '#fff' };
     }
 
+    function toggleMinimized() {
+        state.panelMinimized = !state.panelMinimized;
+        GM_setValue('twh_minimized', state.panelMinimized);
+        renderPanel();
+    }
+
     function ensurePanel() {
         let panel = document.getElementById('twh-panel');
         if (panel) return panel;
@@ -351,40 +357,103 @@
 
         panel.querySelector('#twh-settings-btn').onclick = openSettings;
         panel.querySelector('#twh-refresh').onclick = () => refreshAll();
-        panel.querySelector('#twh-minimize').onclick = () => {
-            state.panelMinimized = !state.panelMinimized;
-            GM_setValue('twh_minimized', state.panelMinimized);
-            renderPanel();
-        };
+        panel.querySelector('#twh-minimize').onclick = toggleMinimized;
         makeDraggable(panel, panel.querySelector('#twh-header'));
+        ensureBubble();
         return panel;
+    }
+
+    function ensureBubble() {
+        let bubble = document.getElementById('twh-bubble');
+        if (bubble) return bubble;
+
+        const savedTop = GM_getValue('twh_bubble_top', Math.round(window.innerHeight / 2) - 23);
+        bubble = document.createElement('div');
+        bubble.id = 'twh-bubble';
+        bubble.style.cssText = `
+            position:fixed;top:${savedTop}px;right:0;width:46px;height:46px;
+            background:#1a1a1a;border:1px solid #444;border-right:none;border-radius:50% 0 0 50%;
+            display:none;align-items:center;justify-content:center;
+            font-family:Arial,sans-serif;font-size:20px;color:#eee;z-index:99999;
+            box-shadow:-2px 2px 12px rgba(0,0,0,0.5);cursor:pointer;touch-action:none;user-select:none;
+        `;
+        bubble.innerHTML = `
+            &#9876;
+            <span id="twh-bubble-badge" style="position:absolute;top:-2px;left:2px;background:#e33;color:#fff;border-radius:8px;min-width:16px;height:16px;font-size:10px;font-family:Arial,sans-serif;line-height:16px;text-align:center;display:none;padding:0 3px;"></span>
+        `;
+        document.body.appendChild(bubble);
+        makeBubbleDraggable(bubble, () => {
+            state.panelMinimized = false;
+            GM_setValue('twh_minimized', false);
+            renderPanel();
+        });
+        return bubble;
     }
 
     function makeDraggable(panel, handle) {
         let dragging = false, offX = 0, offY = 0;
-        handle.addEventListener('mousedown', (e) => {
+        handle.addEventListener('pointerdown', (e) => {
+            if (e.target.closest('button')) return;
             dragging = true;
+            handle.setPointerCapture(e.pointerId);
             const rect = panel.getBoundingClientRect();
             offX = e.clientX - rect.left;
             offY = e.clientY - rect.top;
         });
-        document.addEventListener('mousemove', (e) => {
+        handle.addEventListener('pointermove', (e) => {
             if (!dragging) return;
             panel.style.left = `${e.clientX - offX}px`;
             panel.style.top = `${e.clientY - offY}px`;
             panel.style.right = 'auto';
         });
-        document.addEventListener('mouseup', () => { dragging = false; });
+        handle.addEventListener('pointerup', () => { dragging = false; });
+        handle.addEventListener('pointercancel', () => { dragging = false; });
+    }
+
+    // Vertical-only drag, pinned to the right edge; a tap (no movement) restores the panel.
+    function makeBubbleDraggable(bubble, onTap) {
+        let dragging = false, moved = false, startY = 0, startTop = 0;
+        bubble.addEventListener('pointerdown', (e) => {
+            dragging = true;
+            moved = false;
+            bubble.setPointerCapture(e.pointerId);
+            startY = e.clientY;
+            startTop = bubble.getBoundingClientRect().top;
+        });
+        bubble.addEventListener('pointermove', (e) => {
+            if (!dragging) return;
+            const dy = e.clientY - startY;
+            if (Math.abs(dy) > 5) moved = true;
+            const maxTop = window.innerHeight - bubble.offsetHeight - 8;
+            bubble.style.top = `${Math.max(8, Math.min(maxTop, startTop + dy))}px`;
+        });
+        bubble.addEventListener('pointerup', () => {
+            dragging = false;
+            if (moved) {
+                GM_setValue('twh_bubble_top', parseInt(bubble.style.top, 10));
+            } else {
+                onTap();
+            }
+        });
+        bubble.addEventListener('pointercancel', () => { dragging = false; });
     }
 
     function renderPanel() {
         const panel = ensurePanel();
         const body = panel.querySelector('#twh-body');
+        const bubble = ensureBubble();
 
         if (state.panelMinimized) {
-            body.style.display = 'none';
+            panel.style.display = 'none';
+            bubble.style.display = 'flex';
+            const badge = bubble.querySelector('#twh-bubble-badge');
+            const count = state.calls.length;
+            badge.textContent = count;
+            badge.style.display = count ? 'block' : 'none';
             return;
         }
+        panel.style.display = 'flex';
+        bubble.style.display = 'none';
         body.style.display = 'block';
 
         if (!isConfigured()) {
