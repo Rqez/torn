@@ -8,6 +8,7 @@
 // @grant        GM_xmlhttpRequest
 // @grant        GM_getValue
 // @grant        GM_setValue
+// @grant        unsafeWindow
 // @connect      api.torn.com
 // @connect      torn-kgyr.onrender.com
 // @run-at       document-idle
@@ -866,7 +867,8 @@
     // real measurements for every badge — paste the output back so the
     // positioning logic can be fixed against actual numbers instead of
     // another guess at Torn's markup.
-    window.__iqDebug = function () {
+    const pageWindow = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
+    pageWindow.__iqDebug = window.__iqDebug = function () {
         const rows = findAttackLinks().map((link) => {
             const row = link.closest('li') || link.parentElement;
             const { attackRect, statusRect } = locateColumns(link);
