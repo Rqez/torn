@@ -92,15 +92,22 @@
         const style = document.createElement('style');
         style.id = 'iq-styles';
         style.textContent = `
+            #iq-overlay-layer {
+                position: fixed;
+                top: 0;
+                left: 0;
+                width: 0;
+                height: 0;
+                z-index: 99998;
+            }
             .iq-call-btn {
                 all: unset !important;
                 box-sizing: border-box !important;
+                position: fixed !important;
                 display: inline-flex !important;
-                flex: 0 0 auto !important;
                 align-items: center !important;
                 justify-content: center !important;
-                order: 5 !important;
-                margin: 0 0 0 5px !important;
+                z-index: 99998 !important;
                 padding: 0 !important;
                 width: 17px !important;
                 min-width: 17px !important;
@@ -122,7 +129,7 @@
                 cursor: pointer !important;
                 background: linear-gradient(180deg, #5fcf5f 0%, #3a9a3a 60%, #257a25 100%) !important;
                 color: #fff !important;
-                box-shadow: inset 0 1px 0 rgba(255,255,255,0.25) !important;
+                box-shadow: 0 1px 4px rgba(0,0,0,0.5), inset 0 1px 0 rgba(255,255,255,0.25) !important;
                 text-shadow: 0 1px 1px rgba(0,0,0,0.5) !important;
                 transition: background 0.15s ease, opacity 0.15s ease, transform 0.1s ease !important;
                 vertical-align: middle !important;
@@ -156,6 +163,24 @@
                 height: 22px !important;
                 line-height: 22px !important;
                 font-size: 13px !important;
+            }
+
+            #iq-tooltip {
+                position: fixed;
+                transform: translate(-50%, -100%);
+                background: #16171b;
+                color: #eee;
+                padding: 4px 9px;
+                border: 1px solid rgba(255,255,255,0.12);
+                border-radius: 4px;
+                font-family: Arial, sans-serif;
+                font-size: 11px;
+                white-space: nowrap;
+                pointer-events: none;
+                z-index: 100001;
+                opacity: 0;
+                transition: opacity 0.1s ease;
+                box-shadow: 0 4px 14px rgba(0,0,0,0.5);
             }
 
             #iq-launcher {
@@ -481,67 +506,110 @@
         });
     }
 
-    // ---- Inline injection into Torn's native war page ----
+    // ---- Overlay badges over Torn's native war page ----
     //
     // Every attackable enemy member on the war page renders a real Torn link
     // like `page.php?sid=attack&user2ID=12345`. We anchor off that link (a
     // stable, functional URL — not a hashed CSS-module class name Torn could
-    // rename on any deploy) instead of building a separate floating table, so
-    // the Call button lives right where you're already looking, on desktop
-    // and inside TornPDA's webview alike.
+    // rename on any deploy).
+    //
+    // Earlier this inserted the O/X badge as a new DOM child next to that
+    // link. Torn's war list is a React component that re-renders itself on
+    // its own polling cycle; a foreign node left inside a subtree React
+    // thinks it fully owns makes its next reconciliation pass throw, which
+    // is what was silently wiping out the other faction's list. To avoid
+    // touching Torn's DOM structurally at all, badges live in a layer we own
+    // completely (appended straight to <body>) and are just visually
+    // positioned on top of each Attack link via getBoundingClientRect — we
+    // only ever *read* Torn's DOM, never mutate it.
 
     const ATTACK_HREF_RE = /(?:user2ID|XID)=(\d+)/;
+    const badgesByLink = new Map(); // <a> element -> its overlay badge
+    const callSeenAt = {}; // callId -> first time we observed it (for the "called Xs ago" fallback)
+    let overlayLayer = null;
+    let repositionQueued = false;
 
     function findAttackLinks() {
         return Array.from(document.querySelectorAll('a[href*="sid=attack"]'));
     }
 
-    // Torn's Attack cell is a narrow, fixed-width flex/grid item sized to fit
-    // just the word "Attack" (often with overflow:hidden). Appending our
-    // button *inside* that cell gets it clipped or wrapped onto its own line.
-    // Instead we walk up from the link to whichever ancestor is a *direct
-    // child of the row* — i.e. the Attack column itself — and insert our
-    // button as a new sibling column next to it, so it gets its own space
-    // in the row's flex layout instead of fighting the Attack cell for room.
-    function findRowColumn(link, row) {
-        let el = link;
-        while (el && el.parentElement && el.parentElement !== row) {
-            el = el.parentElement;
-        }
-        return el && el.parentElement === row ? el : link;
+    function ensureOverlayLayer() {
+        if (overlayLayer && document.body.contains(overlayLayer)) return overlayLayer;
+        overlayLayer = document.createElement('div');
+        overlayLayer.id = 'iq-overlay-layer';
+        document.body.appendChild(overlayLayer);
+        return overlayLayer;
+    }
+
+    function positionBadge(link, badge) {
+        const rect = link.getBoundingClientRect();
+        const offscreen = rect.width === 0 && rect.height === 0;
+        badge.style.display = offscreen ? 'none' : 'inline-flex';
+        if (offscreen) return;
+        badge.style.left = `${Math.round(rect.right + 5)}px`;
+        badge.style.top = `${Math.round(rect.top + rect.height / 2 - 8.5)}px`;
+    }
+
+    function scheduleReposition() {
+        if (repositionQueued) return;
+        repositionQueued = true;
+        requestAnimationFrame(() => {
+            repositionQueued = false;
+            badgesByLink.forEach((badge, link) => positionBadge(link, badge));
+            if (tooltipTarget) positionTooltip(tooltipTarget);
+        });
     }
 
     function scanAndInject() {
         if (!state.enemyFactionId) return;
+        const layer = ensureOverlayLayer();
+
         findAttackLinks().forEach((link) => {
             const href = link.getAttribute('href') || '';
             const match = href.match(ATTACK_HREF_RE);
             if (!match) return;
             const memberId = match[1];
 
-            const row = link.closest('li') || link.parentElement;
-            if (!row || row.dataset.iqInjected === memberId) return;
-            if (row.querySelector(':scope > .iq-call-btn')) return;
-
-            const btn = document.createElement('button');
-            btn.type = 'button';
-            btn.className = 'iq-call-btn';
-            btn.dataset.id = memberId;
-            btn.addEventListener('click', (e) => {
-                e.preventDefault();
-                e.stopPropagation();
-                handleCallClick(memberId);
-            });
-            const column = findRowColumn(link, row);
-            column.insertAdjacentElement('afterend', btn);
-            row.dataset.iqInjected = memberId;
+            let badge = badgesByLink.get(link);
+            if (!badge) {
+                badge = document.createElement('button');
+                badge.type = 'button';
+                badge.className = 'iq-call-btn';
+                badge.addEventListener('click', (e) => {
+                    e.preventDefault();
+                    e.stopPropagation();
+                    handleCallClick(badge.dataset.id);
+                });
+                attachTooltip(badge);
+                layer.appendChild(badge);
+                badgesByLink.set(link, badge);
+            }
+            badge.dataset.id = memberId;
+            positionBadge(link, badge);
         });
+
+        // Torn re-renders rows (new tab, pagination, live status updates) which
+        // replaces the underlying <a> nodes — drop badges whose link is gone.
+        badgesByLink.forEach((badge, link) => {
+            if (!document.body.contains(link)) {
+                badge.remove();
+                badgesByLink.delete(link);
+            }
+        });
+
         refreshButtonStates();
     }
 
     function refreshButtonStates() {
         const callsByMember = new Map(state.calls.map((c) => [String(c.memberId), c]));
-        document.querySelectorAll('.iq-call-btn').forEach((btn) => {
+        callsByMember.forEach((c) => {
+            if (!callSeenAt[c.id]) callSeenAt[c.id] = Date.now();
+        });
+        Object.keys(callSeenAt).forEach((id) => {
+            if (!state.calls.some((c) => String(c.id) === id)) delete callSeenAt[id];
+        });
+
+        badgesByLink.forEach((btn) => {
             const id = btn.dataset.id;
             const call = callsByMember.get(id);
             btn.classList.remove('iq-mine', 'iq-other');
@@ -549,18 +617,88 @@
                 const isMine = String(call.callerId) === String(state.playerId);
                 btn.classList.add(isMine ? 'iq-mine' : 'iq-other');
                 btn.textContent = 'X';
-                btn.title = isMine
-                    ? 'You called this target — click to release'
-                    : `Claimed by ${call.callerName}`;
                 btn.disabled = !isMine;
             } else {
-                const member = state.members.find((m) => m.id === id);
                 btn.textContent = 'O';
-                btn.title = member ? `Available — click to call ${member.name}` : 'Available — click to call';
                 btn.disabled = false;
             }
         });
     }
+
+    // ---- Custom tooltip with a live countdown ----
+    //
+    // Native `title` tooltips are static text — they can't tick down while
+    // held open. This is a small floating element we update on an interval
+    // for as long as the mouse stays over a badge.
+
+    let tooltipEl = null;
+    let tooltipTimer = null;
+    let tooltipTarget = null;
+
+    function ensureTooltipEl() {
+        if (tooltipEl && document.body.contains(tooltipEl)) return tooltipEl;
+        tooltipEl = document.createElement('div');
+        tooltipEl.id = 'iq-tooltip';
+        document.body.appendChild(tooltipEl);
+        return tooltipEl;
+    }
+
+    function tooltipTextFor(badge) {
+        const id = badge.dataset.id;
+        const call = state.calls.find((c) => String(c.memberId) === String(id));
+        if (!call) {
+            const member = state.members.find((m) => m.id === id);
+            return member ? `Available — click to call ${member.name}` : 'Available — click to call';
+        }
+        const isMine = String(call.callerId) === String(state.playerId);
+        const base = isMine ? 'You called this target — click to release' : `Claimed by ${call.callerName}`;
+
+        const okaySince = callOkaySince[call.id];
+        if (okaySince) {
+            const remaining = Math.max(0, 60 - Math.floor((Date.now() - okaySince) / 1000));
+            return `${base} · auto-release in ${remaining}s`;
+        }
+        const seenAt = callSeenAt[call.id];
+        if (seenAt) {
+            const elapsed = Math.floor((Date.now() - seenAt) / 1000);
+            return `${base} · called ${elapsed}s ago`;
+        }
+        return base;
+    }
+
+    function positionTooltip(badge) {
+        const tip = ensureTooltipEl();
+        const rect = badge.getBoundingClientRect();
+        tip.style.left = `${Math.round(rect.left + rect.width / 2)}px`;
+        tip.style.top = `${Math.round(rect.top - 6)}px`;
+    }
+
+    function attachTooltip(badge) {
+        badge.addEventListener('mouseenter', () => {
+            tooltipTarget = badge;
+            const tip = ensureTooltipEl();
+            tip.textContent = tooltipTextFor(badge);
+            positionTooltip(badge);
+            tip.style.opacity = '1';
+            if (tooltipTimer) clearInterval(tooltipTimer);
+            tooltipTimer = setInterval(() => {
+                if (tooltipTarget !== badge || !document.body.contains(badge)) {
+                    clearInterval(tooltipTimer);
+                    return;
+                }
+                tip.textContent = tooltipTextFor(badge);
+                positionTooltip(badge);
+            }, 1000);
+        });
+        badge.addEventListener('mouseleave', () => {
+            if (tooltipTimer) clearInterval(tooltipTimer);
+            tooltipTarget = null;
+            if (tooltipEl) tooltipEl.style.opacity = '0';
+        });
+    }
+
+    document.addEventListener('scroll', scheduleReposition, true);
+    window.addEventListener('resize', scheduleReposition);
 
     // ---- Launcher + status widget ----
 
