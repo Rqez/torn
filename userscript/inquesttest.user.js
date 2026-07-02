@@ -862,6 +862,30 @@
         }, 1500);
     }
 
+    // Run __iqDebug() in the browser console on the war page to dump the
+    // real measurements for every badge — paste the output back so the
+    // positioning logic can be fixed against actual numbers instead of
+    // another guess at Torn's markup.
+    window.__iqDebug = function () {
+        const rows = findAttackLinks().map((link) => {
+            const row = link.closest('li') || link.parentElement;
+            const { attackRect, statusRect } = locateColumns(link);
+            return {
+                href: link.getAttribute('href'),
+                linkRect: link.getBoundingClientRect(),
+                attackRect,
+                statusRect,
+                rowTag: row && row.tagName,
+                rowClass: row && row.className,
+                rowOuterHTML: row ? row.outerHTML.slice(0, 400) : null,
+            };
+        });
+        console.log('[InQuest debug] bodyTransform:', getComputedStyle(document.body).transform);
+        console.log('[InQuest debug] htmlTransform:', getComputedStyle(document.documentElement).transform);
+        console.log('[InQuest debug] rows:', rows);
+        return rows;
+    };
+
     async function init() {
         injectStyles();
         if (isPDA) document.body.classList.add('iq-pda');
