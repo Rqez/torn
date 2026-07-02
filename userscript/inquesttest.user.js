@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         InQuest Target Caller
 // @namespace    inquest-target-caller
-// @version      2.0.0
+// @version      2.1.0
 // @description  Faction war overlay: enemy status list + call/claim coordination, backed by your own sync server
 // @author       you
 // @match        https://www.torn.com/factions.php*
@@ -729,6 +729,12 @@
             <div id="iq-widget-body">
                 <p>${warLine}</p>
                 <div class="iq-row"><span>${syncLine}</span></div>
+                <p style="color:#888;font-size:10px;">
+                    Attack links found: ${findAttackLinks().length}<br>
+                    Call buttons injected: ${document.querySelectorAll('.iq-call-btn').length}<br>
+                    Enemy members loaded: ${state.members.length}<br>
+                    Script build: iq-2025-07-02-1
+                </p>
                 <div class="iq-row" style="gap:8px;">
                     <button id="iq-widget-refresh" class="iq-btn">Refresh</button>
                     <button id="iq-widget-settings" class="iq-btn">Settings</button>
