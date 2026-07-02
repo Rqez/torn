@@ -103,23 +103,23 @@
                 align-items: center !important;
                 justify-content: center !important;
                 z-index: 10 !important;
-                padding: 2px 7px !important;
-                min-width: 40px !important;
-                width: max-content !important;
-                max-width: none !important;
-                height: 18px !important;
+                padding: 0 !important;
+                min-width: 17px !important;
+                width: 17px !important;
+                max-width: 17px !important;
+                height: 17px !important;
                 font-family: Arial, sans-serif !important;
-                font-size: 9px !important;
-                font-weight: 700 !important;
+                font-size: 11px !important;
+                font-weight: 800 !important;
                 line-height: 1 !important;
-                text-transform: uppercase !important;
-                letter-spacing: 0.3px !important;
+                text-transform: none !important;
+                letter-spacing: 0 !important;
                 text-align: center !important;
                 text-indent: 0 !important;
                 text-overflow: clip !important;
                 text-decoration: none !important;
                 overflow: visible !important;
-                border-radius: 3px !important;
+                border-radius: 50% !important;
                 border: 1px solid #163a1a !important;
                 cursor: pointer !important;
                 background: linear-gradient(180deg, #5fcf5f 0%, #3a9a3a 60%, #257a25 100%) !important;
@@ -136,12 +136,12 @@
                 background: linear-gradient(180deg, #6fdf6f 0%, #4aaa4a 60%, #358a35 100%) !important;
             }
             .iq-call-btn.iq-mine {
-                background: linear-gradient(180deg, #ffcf5f 0%, #d99a2a 60%, #a8710f 100%) !important;
-                border-color: #6b4308 !important;
+                background: linear-gradient(180deg, #e06a6a 0%, #b53a3a 60%, #7a1f1f 100%) !important;
+                border-color: #4a1010 !important;
                 color: #fff !important;
             }
             .iq-call-btn.iq-mine:hover {
-                background: linear-gradient(180deg, #ffdf7f 0%, #e9aa3a 60%, #b8811f 100%) !important;
+                background: linear-gradient(180deg, #f07a7a 0%, #c54a4a 60%, #8a2f2f 100%) !important;
             }
             .iq-call-btn.iq-other {
                 background: linear-gradient(180deg, #e06a6a 0%, #b53a3a 60%, #7a1f1f 100%) !important;
@@ -151,15 +151,16 @@
                 opacity: 0.9 !important;
             }
             body.iq-pda .iq-call-btn {
-                min-width: 50px !important;
-                height: 24px !important;
-                font-size: 11px !important;
-                padding: 3px 9px !important;
+                min-width: 22px !important;
+                width: 22px !important;
+                max-width: 22px !important;
+                height: 22px !important;
+                font-size: 13px !important;
             }
             .iq-call-btn .iq-tooltip {
                 all: unset !important;
                 position: absolute !important;
-                bottom: calc(100% + 6px) !important;
+                top: calc(100% + 6px) !important;
                 left: 50% !important;
                 transform: translateX(-50%) !important;
                 display: block !important;
@@ -175,7 +176,7 @@
                 letter-spacing: normal !important;
                 white-space: nowrap !important;
                 pointer-events: none !important;
-                z-index: 20 !important;
+                z-index: 999 !important;
                 opacity: 0 !important;
                 transition: opacity 0.1s ease !important;
                 box-shadow: 0 4px 14px rgba(0,0,0,0.5) !important;
@@ -609,10 +610,10 @@
             if (call) {
                 const isMine = String(call.callerId) === String(state.playerId);
                 btn.classList.add(isMine ? 'iq-mine' : 'iq-other');
-                label.textContent = isMine ? 'Uncall' : 'Called';
+                label.textContent = 'X';
                 btn.disabled = !isMine;
             } else {
-                label.textContent = 'Call';
+                label.textContent = 'O';
                 btn.disabled = false;
             }
         });
