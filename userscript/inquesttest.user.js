@@ -108,23 +108,23 @@
                 align-items: center !important;
                 justify-content: center !important;
                 z-index: 99998 !important;
-                padding: 0 !important;
-                width: 17px !important;
-                min-width: 17px !important;
-                max-width: 17px !important;
-                height: 17px !important;
+                padding: 2px 7px !important;
+                min-width: 40px !important;
+                width: auto !important;
+                max-width: none !important;
+                height: 18px !important;
                 font-family: Arial, sans-serif !important;
-                font-size: 11px !important;
-                font-weight: 800 !important;
-                line-height: 17px !important;
-                text-transform: none !important;
-                letter-spacing: 0 !important;
+                font-size: 9px !important;
+                font-weight: 700 !important;
+                line-height: 1 !important;
+                text-transform: uppercase !important;
+                letter-spacing: 0.3px !important;
                 text-align: center !important;
                 text-indent: 0 !important;
                 text-overflow: clip !important;
                 text-decoration: none !important;
                 overflow: visible !important;
-                border-radius: 50% !important;
+                border-radius: 3px !important;
                 border: 1px solid #163a1a !important;
                 cursor: pointer !important;
                 background: linear-gradient(180deg, #5fcf5f 0%, #3a9a3a 60%, #257a25 100%) !important;
@@ -134,6 +134,10 @@
                 transition: background 0.15s ease, opacity 0.15s ease, transform 0.1s ease !important;
                 vertical-align: middle !important;
                 white-space: nowrap !important;
+            }
+            .iq-call-btn.iq-hidden {
+                visibility: hidden !important;
+                pointer-events: none !important;
             }
             .iq-call-btn:hover:not(:disabled) {
                 background: linear-gradient(180deg, #6fdf6f 0%, #4aaa4a 60%, #358a35 100%) !important;
@@ -157,12 +161,10 @@
                 opacity: 0.9 !important;
             }
             body.iq-pda .iq-call-btn {
-                width: 22px !important;
-                min-width: 22px !important;
-                max-width: 22px !important;
-                height: 22px !important;
-                line-height: 22px !important;
-                font-size: 13px !important;
+                min-width: 50px !important;
+                height: 24px !important;
+                font-size: 11px !important;
+                padding: 3px 9px !important;
             }
 
             #iq-tooltip {
@@ -541,13 +543,48 @@
         return overlayLayer;
     }
 
+    // Some Attack "links" are just a hit-target wrapping an icon/child element
+    // (e.g. styled with display:contents), so the <a> itself reports a 0x0
+    // box — fall back to a child's box in that case instead of hiding the
+    // badge at (0,0), which is what was making it vanish.
+    function measureRect(el) {
+        if (!el) return null;
+        const rect = el.getBoundingClientRect();
+        if (rect.width || rect.height) return rect;
+        const child = el.querySelector('*');
+        return child ? child.getBoundingClientRect() : rect;
+    }
+
+    // Walk up from the Attack link to whichever ancestor is a direct child of
+    // the row (i.e. the Attack column itself), purely to *read* its position
+    // and its previous sibling's (the Status column) — no DOM writes here.
+    function locateColumns(link) {
+        const row = link.closest('li') || link.parentElement;
+        if (!row) return { attackRect: measureRect(link), statusRect: null };
+        let col = link;
+        while (col.parentElement && col.parentElement !== row) col = col.parentElement;
+        const attackCol = col.parentElement === row ? col : link;
+        const statusCol = attackCol.previousElementSibling;
+        return {
+            attackRect: measureRect(attackCol),
+            statusRect: statusCol ? measureRect(statusCol) : null,
+        };
+    }
+
     function positionBadge(link, badge) {
-        const rect = link.getBoundingClientRect();
-        const offscreen = rect.width === 0 && rect.height === 0;
-        badge.style.display = offscreen ? 'none' : 'inline-flex';
-        if (offscreen) return;
-        badge.style.left = `${Math.round(rect.right + 5)}px`;
-        badge.style.top = `${Math.round(rect.top + rect.height / 2 - 8.5)}px`;
+        const { attackRect, statusRect } = locateColumns(link);
+        if (!attackRect || (attackRect.width === 0 && attackRect.height === 0)) {
+            badge.classList.add('iq-hidden');
+            return;
+        }
+        badge.classList.remove('iq-hidden');
+        const bw = badge.offsetWidth || 46;
+        const bh = badge.offsetHeight || 18;
+        const centerX = (statusRect && statusRect.width)
+            ? (statusRect.right + attackRect.left) / 2
+            : attackRect.left - bw / 2 - 6;
+        badge.style.left = `${Math.round(centerX - bw / 2)}px`;
+        badge.style.top = `${Math.round(attackRect.top + attackRect.height / 2 - bh / 2)}px`;
     }
 
     function scheduleReposition() {
@@ -616,10 +653,10 @@
             if (call) {
                 const isMine = String(call.callerId) === String(state.playerId);
                 btn.classList.add(isMine ? 'iq-mine' : 'iq-other');
-                btn.textContent = 'X';
+                btn.textContent = isMine ? 'Uncall' : 'Called';
                 btn.disabled = !isMine;
             } else {
-                btn.textContent = 'O';
+                btn.textContent = 'Call';
                 btn.disabled = false;
             }
         });
