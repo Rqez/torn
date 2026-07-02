@@ -11,7 +11,6 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-// factionId -> Map<memberId, CallRecord>
 const callsByFaction = new Map();
 
 function requireAuth(req, res, next) {
@@ -37,6 +36,7 @@ function cleanupExpired() {
 }
 setInterval(cleanupExpired, 60 * 1000);
 
+app.get('/', (req, res) => res.json({ ok: true, service: 'torn-war-helper' }));
 app.get('/health', (req, res) => res.json({ ok: true }));
 
 app.get('/api/calls', requireAuth, (req, res) => {
