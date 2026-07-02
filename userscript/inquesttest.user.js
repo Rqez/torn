@@ -93,55 +93,66 @@
         style.id = 'iq-styles';
         style.textContent = `
             .iq-call-btn {
-                display: inline-flex;
-                align-items: center;
-                justify-content: center;
-                margin-left: 6px;
-                padding: 3px 8px;
-                min-width: 44px;
-                height: 20px;
-                font-family: Arial, sans-serif;
-                font-size: 10px;
-                font-weight: 700;
-                text-transform: uppercase;
-                letter-spacing: 0.3px;
-                border-radius: 3px;
-                border: 1px solid #111;
-                cursor: pointer;
-                background: linear-gradient(180deg, #3d3d3d 0%, #262626 60%, #1a1a1a 100%);
-                color: #eee;
-                box-shadow: inset 0 1px 0 rgba(255,255,255,0.06);
-                text-shadow: 0 1px 1px rgba(0,0,0,0.6);
-                transition: background 0.15s ease, opacity 0.15s ease, transform 0.1s ease;
-                vertical-align: middle;
-                white-space: nowrap;
+                all: unset !important;
+                box-sizing: border-box !important;
+                display: inline-flex !important;
+                flex: 0 0 auto !important;
+                align-items: center !important;
+                justify-content: center !important;
+                order: 5 !important;
+                margin: 0 0 0 6px !important;
+                padding: 3px 8px !important;
+                min-width: 40px !important;
+                max-width: none !important;
+                height: 20px !important;
+                font-family: Arial, sans-serif !important;
+                font-size: 10px !important;
+                font-weight: 700 !important;
+                line-height: normal !important;
+                text-transform: uppercase !important;
+                letter-spacing: 0.3px !important;
+                text-align: center !important;
+                text-indent: 0 !important;
+                text-overflow: clip !important;
+                text-decoration: none !important;
+                overflow: visible !important;
+                border-radius: 3px !important;
+                border: 1px solid #111 !important;
+                cursor: pointer !important;
+                background: linear-gradient(180deg, #3d3d3d 0%, #262626 60%, #1a1a1a 100%) !important;
+                color: #eee !important;
+                box-shadow: inset 0 1px 0 rgba(255,255,255,0.06) !important;
+                text-shadow: 0 1px 1px rgba(0,0,0,0.6) !important;
+                transition: background 0.15s ease, opacity 0.15s ease, transform 0.1s ease !important;
+                vertical-align: middle !important;
+                white-space: nowrap !important;
             }
             .iq-call-btn:hover:not(:disabled) {
-                background: linear-gradient(180deg, #4d4d4d 0%, #303030 60%, #202020 100%);
+                background: linear-gradient(180deg, #4d4d4d 0%, #303030 60%, #202020 100%) !important;
             }
             .iq-call-btn:active:not(:disabled) {
-                transform: translateY(1px);
+                transform: translateY(1px) !important;
             }
             .iq-call-btn.iq-mine {
-                background: linear-gradient(180deg, #6bb300 0%, #4a7a00 55%, #2f5000 100%);
-                border-color: #1a3000;
-                color: #fff;
+                background: linear-gradient(180deg, #6bb300 0%, #4a7a00 55%, #2f5000 100%) !important;
+                border-color: #1a3000 !important;
+                color: #fff !important;
             }
             .iq-call-btn.iq-mine:hover {
-                background: linear-gradient(180deg, #7bc300 0%, #5a8a00 55%, #3f6000 100%);
+                background: linear-gradient(180deg, #7bc300 0%, #5a8a00 55%, #3f6000 100%) !important;
             }
             .iq-call-btn.iq-other {
-                background: linear-gradient(180deg, #9a5330 0%, #6b3218 55%, #401e0d 100%);
-                border-color: #2e1108;
-                color: #ffd9c2;
-                cursor: not-allowed;
-                opacity: 0.9;
+                background: linear-gradient(180deg, #9a5330 0%, #6b3218 55%, #401e0d 100%) !important;
+                border-color: #2e1108 !important;
+                color: #ffd9c2 !important;
+                cursor: not-allowed !important;
+                opacity: 0.9 !important;
             }
             body.iq-pda .iq-call-btn {
-                min-width: 54px;
-                height: 27px;
-                font-size: 11px;
-                padding: 4px 10px;
+                min-width: 54px !important;
+                height: 27px !important;
+                font-size: 11px !important;
+                padding: 4px 10px !important;
             }
 
             #iq-launcher {
@@ -482,6 +493,21 @@
         return Array.from(document.querySelectorAll('a[href*="sid=attack"]'));
     }
 
+    // Torn's Attack cell is a narrow, fixed-width flex/grid item sized to fit
+    // just the word "Attack" (often with overflow:hidden). Appending our
+    // button *inside* that cell gets it clipped or wrapped onto its own line.
+    // Instead we walk up from the link to whichever ancestor is a *direct
+    // child of the row* — i.e. the Attack column itself — and insert our
+    // button as a new sibling column next to it, so it gets its own space
+    // in the row's flex layout instead of fighting the Attack cell for room.
+    function findRowColumn(link, row) {
+        let el = link;
+        while (el && el.parentElement && el.parentElement !== row) {
+            el = el.parentElement;
+        }
+        return el && el.parentElement === row ? el : link;
+    }
+
     function scanAndInject() {
         if (!state.enemyFactionId) return;
         findAttackLinks().forEach((link) => {
@@ -503,7 +529,8 @@
                 e.stopPropagation();
                 handleCallClick(memberId);
             });
-            link.insertAdjacentElement('afterend', btn);
+            const column = findRowColumn(link, row);
+            column.insertAdjacentElement('afterend', btn);
             row.dataset.iqInjected = memberId;
         });
         refreshButtonStates();
