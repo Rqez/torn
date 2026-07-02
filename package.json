@@ -5,8 +5,7 @@
   "description": "Tiny sync server for the Torn War Helper userscript's call/claim system",
   "main": "index.js",
   "scripts": {
-    "start": "node index.js",
-    "dev": "node --watch index.js"
+    "start": "node index.js"
   },
   "dependencies": {
     "cors": "^2.8.5",
