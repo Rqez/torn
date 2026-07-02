@@ -103,13 +103,13 @@
                 align-items: center !important;
                 justify-content: center !important;
                 z-index: 10 !important;
-                padding: 0 !important;
-                min-width: 17px !important;
-                width: 17px !important;
-                max-width: 17px !important;
-                height: 17px !important;
+                padding: 2px 7px !important;
+                min-width: 22px !important;
+                width: max-content !important;
+                max-width: none !important;
+                height: 18px !important;
                 font-family: Arial, sans-serif !important;
-                font-size: 11px !important;
+                font-size: 12px !important;
                 font-weight: 800 !important;
                 line-height: 1 !important;
                 text-transform: none !important;
@@ -119,7 +119,7 @@
                 text-overflow: clip !important;
                 text-decoration: none !important;
                 overflow: visible !important;
-                border-radius: 50% !important;
+                border-radius: 3px !important;
                 border: 1px solid #163a1a !important;
                 cursor: pointer !important;
                 background: linear-gradient(180deg, #5fcf5f 0%, #3a9a3a 60%, #257a25 100%) !important;
@@ -151,11 +151,10 @@
                 opacity: 0.9 !important;
             }
             body.iq-pda .iq-call-btn {
-                min-width: 22px !important;
-                width: 22px !important;
-                max-width: 22px !important;
-                height: 22px !important;
-                font-size: 13px !important;
+                min-width: 28px !important;
+                height: 24px !important;
+                font-size: 14px !important;
+                padding: 3px 9px !important;
             }
             .iq-call-btn .iq-tooltip {
                 all: unset !important;
