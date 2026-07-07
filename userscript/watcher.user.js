@@ -22,7 +22,7 @@
   // ════════════════════════════════════════════════════════════
 
   const CONFIG = {
-    pollIntervalMs: 10_000,   // how often to re-check every watched player
+    pollIntervalMs: 1_000,   // how often to re-check every watched player
     perRequestDelayMs: 800,  // gap between individual API calls (Torn's soft limit is ~100/min)
   };
 
