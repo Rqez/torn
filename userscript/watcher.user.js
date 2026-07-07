@@ -22,7 +22,7 @@
   // ════════════════════════════════════════════════════════════
 
   const CONFIG = {
-    pollIntervalMs: 3_000,   // how often to re-check every watched player
+    checkGapMs: 3_000,       // gap between checking one profile and the next (not per full cycle)
     perRequestDelayMs: 800,  // gap between calls REUSING THE SAME key (Torn's soft limit is ~100/min/key)
     maxApiKeys: 10,
   };
@@ -38,7 +38,7 @@
   };
 
   const TAB_ID = Math.random().toString(36).slice(2, 10);
-  const LOCK_TTL_MS = CONFIG.pollIntervalMs * 4;
+  const LOCK_TTL_MS = CONFIG.checkGapMs * 4;
 
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -198,41 +198,45 @@
     console.log(`[TLW] ${curr.name} (${curr.id}): baseline set — ${curr.state} (${curr.description})`);
   }
 
-  async function pollOnce() {
-    const ids = getWatchList();
-    if (ids.length === 0) return;
-    const lastStatus = GM_getValue(LS.lastStatus, {});
+  // Round-robins through the watch list one player at a time — the caller
+  // (the main loop) waits CONFIG.checkGapMs between calling this, so
+  // consecutive profile checks land exactly checkGapMs apart, regardless of
+  // how many players are being watched.
+  let playerRotationIndex = 0;
 
-    for (const id of ids) {
-      if (!isRunning()) return;
-      try {
-        const curr = await fetchStatus(id);
-        if (!curr) continue;
-        const prev = lastStatus[id];
-        if (!prev) {
-          // First time seeing this player — record a baseline and notify,
-          // so you get immediate confirmation the watcher is actually working.
-          lastStatus[id] = { name: curr.name, state: curr.state, description: curr.description };
-          GM_setValue(LS.lastStatus, lastStatus);
-          notifyBaseline(curr);
-        } else {
-          // Only the state (Okay/Hospital/Jail/Traveling/Abroad/Federal) drives
-          // a notification. description is ignored here on purpose — while
-          // hospitalised it contains a countdown that changes every poll,
-          // which would otherwise fire a "change" notification every cycle.
-          // We still always re-save name/description below so the on-page
-          // panel reflects the latest countdown/location text.
-          if (prev.state !== curr.state) notifyChange(prev, curr);
-          lastStatus[id] = { name: curr.name, state: curr.state, description: curr.description };
-          GM_setValue(LS.lastStatus, lastStatus);
-        }
-      } catch (e) {
-        console.warn(`[TLW] Failed to fetch status for ${id}:`, e.message);
+  function nextPlayerId() {
+    const ids = getWatchList();
+    if (ids.length === 0) return null;
+    const id = ids[playerRotationIndex % ids.length];
+    playerRotationIndex++;
+    return id;
+  }
+
+  async function checkOnePlayer(id) {
+    const lastStatus = GM_getValue(LS.lastStatus, {});
+    try {
+      const curr = await fetchStatus(id);
+      if (!curr) return;
+      const prev = lastStatus[id];
+      if (!prev) {
+        // First time seeing this player — record a baseline and notify,
+        // so you get immediate confirmation the watcher is actually working.
+        lastStatus[id] = { name: curr.name, state: curr.state, description: curr.description };
+        GM_setValue(LS.lastStatus, lastStatus);
+        notifyBaseline(curr);
+      } else {
+        // Only the state (Okay/Hospital/Jail/Traveling/Abroad/Federal) drives
+        // a notification. description is ignored here on purpose — while
+        // hospitalised it contains a countdown that changes every check,
+        // which would otherwise fire a "change" notification constantly.
+        // We still always re-save name/description below so the on-page
+        // panel reflects the latest countdown/location text.
+        if (prev.state !== curr.state) notifyChange(prev, curr);
+        lastStatus[id] = { name: curr.name, state: curr.state, description: curr.description };
+        GM_setValue(LS.lastStatus, lastStatus);
       }
-      // Refresh per-ID, not just once per cycle — with a short poll interval
-      // and enough watched players, a full pass can outlast LOCK_TTL_MS,
-      // which would otherwise let another open tab steal the lock mid-cycle.
-      refreshLock();
+    } catch (e) {
+      console.warn(`[TLW] Failed to fetch status for ${id}:`, e.message);
     }
   }
 
@@ -336,25 +340,28 @@
     while (isRunning()) {
       if (getApiKeys().length === 0) {
         console.warn('[TLW] No API keys set. Use the Tampermonkey menu "Set Torn API Keys".');
-        await sleep(CONFIG.pollIntervalMs);
+        await sleep(CONFIG.checkGapMs);
         continue;
       }
       if (getWatchList().length === 0) {
         console.warn('[TLW] No player IDs set. Use the Tampermonkey menu "Set Watched Player IDs".');
-        await sleep(CONFIG.pollIntervalMs);
+        await sleep(CONFIG.checkGapMs);
         continue;
       }
       if (!claimLock()) {
-        await sleep(CONFIG.pollIntervalMs);
+        await sleep(CONFIG.checkGapMs);
         continue;
       }
-      try {
-        refreshLock();
-        await pollOnce();
-      } catch (e) {
-        console.error('[TLW] Poll cycle failed:', e.message);
+      refreshLock();
+      const id = nextPlayerId();
+      if (id != null) {
+        try {
+          await checkOnePlayer(id);
+        } catch (e) {
+          console.error('[TLW] Check failed:', e.message);
+        }
       }
-      await sleep(CONFIG.pollIntervalMs);
+      await sleep(CONFIG.checkGapMs);
     }
     console.log('[TLW] Stopped.');
   }
