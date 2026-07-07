@@ -11,6 +11,8 @@
 // @grant        GM_registerMenuCommand
 // @grant        GM_addValueChangeListener
 // @connect      api.torn.com
+// @connect      discord.com
+// @connect      discordapp.com
 // @run-at       document-idle
 // ==/UserScript==
 
@@ -35,6 +37,8 @@
     lastStatus: 'tlw_last_status', // { [id]: { state, description } }
     running: 'tlw_running',
     lock: 'tlw_lock',
+    discordWebhook: 'tlw_discord_webhook',
+    discordMessageId: 'tlw_discord_message_id',
   };
 
   const TAB_ID = Math.random().toString(36).slice(2, 10);
@@ -65,21 +69,180 @@
   });
 
   // ════════════════════════════════════════════════════════════
+  //  DISCORD RELAY — optional. Instead of posting a new message per event,
+  //  this keeps ONE message alive and edits it in place, mirroring the
+  //  on-page panel — a friend watching that Discord channel sees the same
+  //  always-current dashboard, not a growing feed of separate alerts.
+  // ════════════════════════════════════════════════════════════
+
+  function getDiscordWebhook() {
+    return GM_getValue(LS.discordWebhook, '');
+  }
+
+  GM_registerMenuCommand('🔔 Set Discord Webhook (for friend)', () => {
+    const current = getDiscordWebhook();
+    const url = prompt(
+      "Enter a Discord webhook URL to relay a live status dashboard to a friend's channel (Discord: Channel Settings → Integrations → Webhooks → New Webhook → Copy URL). Leave blank to disable:",
+      current
+    );
+    if (url == null) return;
+    GM_setValue(LS.discordWebhook, url.trim());
+    GM_setValue(LS.discordMessageId, null); // start a fresh message under the new webhook
+    alert(url.trim() ? 'Discord webhook saved.' : 'Discord webhook cleared — alerts will only show locally.');
+  });
+
+  // Torn's description is sometimes just a repeat of state (e.g. state="Okay",
+  // description="Okay"), which reads as a redundant "Okay — Okay". When that
+  // happens, show the physical location (Torn, for Okay/Jail/Federal) instead
+  // of the duplicate — e.g. "Torn — Okay". Any other combo (Hospital/Traveling/
+  // Abroad, where description actually adds detail) is left as-is.
+  function formatStatusLine(state, description) {
+    if (description === state) {
+      const location = (state === 'Okay' || state === 'Jail' || state === 'Federal') ? 'Torn' : state;
+      return `${location} — ${state}`;
+    }
+    return `${state}${description ? ' — ' + description : ''}`;
+  }
+
+  // Builds the same status list the on-page panel shows, as Discord markdown.
+  // Disabled players are struck through, same as the panel dims them.
+  function buildDiscordContent() {
+    const list = getWatchList();
+    if (list.length === 0) return '📍 **Location Watch** — no players watched.';
+    const lastStatus = GM_getValue(LS.lastStatus, {});
+    const lines = list.map((entry) => {
+      const s = lastStatus[entry.id];
+      const name = (s && s.name) || `#${entry.id}`;
+      const line = s ? formatStatusLine(s.state, s.description) : 'checking...';
+      const text = `**${name}**: ${line}`;
+      return entry.enabled ? text : `~~${text}~~`;
+    });
+    return `📍 **Location Watch**\n${lines.join('\n')}`;
+  }
+
+  function postNewDiscordMessage(webhook, content) {
+    GM_xmlhttpRequest({
+      method: 'POST',
+      url: `${webhook}?wait=true`,
+      headers: { 'Content-Type': 'application/json' },
+      data: JSON.stringify({ content }),
+      onload: (r) => {
+        if (r.status < 200 || r.status >= 300) {
+          console.warn(`[TLW] Discord post failed: HTTP ${r.status} — ${r.responseText.slice(0, 200)}`);
+          return;
+        }
+        try {
+          const msg = JSON.parse(r.responseText);
+          if (msg.id) GM_setValue(LS.discordMessageId, msg.id);
+        } catch {
+          console.warn('[TLW] Discord post succeeded but response could not be parsed for message id.');
+        }
+      },
+      onerror: () => console.warn('[TLW] Discord post request failed (network error).'),
+    });
+  }
+
+  function syncDiscordMessage() {
+    const webhook = getDiscordWebhook();
+    if (!webhook) return;
+    const content = buildDiscordContent();
+    const messageId = GM_getValue(LS.discordMessageId, null);
+
+    if (!messageId) {
+      postNewDiscordMessage(webhook, content);
+      return;
+    }
+
+    GM_xmlhttpRequest({
+      method: 'PATCH',
+      url: `${webhook}/messages/${messageId}`,
+      headers: { 'Content-Type': 'application/json' },
+      data: JSON.stringify({ content }),
+      onload: (r) => {
+        if (r.status === 404) {
+          // The message was deleted on Discord's side — start a new one.
+          GM_setValue(LS.discordMessageId, null);
+          postNewDiscordMessage(webhook, content);
+        } else if (r.status < 200 || r.status >= 300) {
+          console.warn(`[TLW] Discord edit failed: HTTP ${r.status} — ${r.responseText.slice(0, 200)}`);
+        }
+      },
+      onerror: () => console.warn('[TLW] Discord edit request failed (network error).'),
+    });
+  }
+
+  // Separate from the persistent dashboard message above — this posts a
+  // one-off "something changed" ping that self-deletes ~10s later, so a
+  // friend gets an actual notification-style blip instead of only the
+  // silently-updating dashboard.
+  const TRANSIENT_ALERT_TTL_MS = 10_000;
+
+  function deleteDiscordMessage(webhook, messageId) {
+    GM_xmlhttpRequest({
+      method: 'DELETE',
+      url: `${webhook}/messages/${messageId}`,
+      onload: (r) => {
+        if ((r.status < 200 || r.status >= 300) && r.status !== 404) {
+          console.warn(`[TLW] Discord alert delete failed: HTTP ${r.status} — ${r.responseText.slice(0, 200)}`);
+        }
+      },
+      onerror: () => console.warn('[TLW] Discord alert delete request failed (network error).'),
+    });
+  }
+
+  function sendTransientDiscordAlert(content) {
+    const webhook = getDiscordWebhook();
+    if (!webhook) return;
+    GM_xmlhttpRequest({
+      method: 'POST',
+      url: `${webhook}?wait=true`,
+      headers: { 'Content-Type': 'application/json' },
+      data: JSON.stringify({ content }),
+      onload: (r) => {
+        if (r.status < 200 || r.status >= 300) {
+          console.warn(`[TLW] Discord alert post failed: HTTP ${r.status} — ${r.responseText.slice(0, 200)}`);
+          return;
+        }
+        try {
+          const msg = JSON.parse(r.responseText);
+          if (msg.id) setTimeout(() => deleteDiscordMessage(webhook, msg.id), TRANSIENT_ALERT_TTL_MS);
+        } catch {
+          console.warn('[TLW] Discord alert posted but response could not be parsed for message id — it will not auto-delete.');
+        }
+      },
+      onerror: () => console.warn('[TLW] Discord alert post request failed (network error).'),
+    });
+  }
+
+  // ════════════════════════════════════════════════════════════
   //  WATCH LIST
   // ════════════════════════════════════════════════════════════
 
+  // Stored as [{ id, enabled }] rather than a bare id array, so each player
+  // can be toggled on/off from the on-page panel without losing their spot
+  // in the list.
   function getWatchList() {
     return GM_getValue(LS.watchList, []);
   }
 
+  function getEnabledIds() {
+    return getWatchList().filter((e) => e.enabled).map((e) => e.id);
+  }
+
   GM_registerMenuCommand('📋 Set Watched Player IDs', () => {
-    const current = getWatchList().join(', ');
+    const current = getWatchList().map((e) => e.id).join(', ');
     const input = prompt('Enter player IDs to watch, comma-separated (e.g. 1234567, 2345678):', current);
     if (input == null) return;
     const ids = input.split(',')
       .map((s) => parseInt(s.trim(), 10))
       .filter((n) => Number.isFinite(n) && n > 0);
-    GM_setValue(LS.watchList, ids);
+
+    // Preserve each existing player's enabled/disabled toggle; new entries
+    // default to enabled.
+    const existingEnabled = new Map(getWatchList().map((e) => [e.id, e.enabled]));
+    const newList = ids.map((id) => ({ id, enabled: existingEnabled.has(id) ? existingEnabled.get(id) : true }));
+    GM_setValue(LS.watchList, newList);
+
     // Clear stale baselines for anyone no longer watched, so a re-added ID
     // starts fresh instead of comparing against very old state.
     const lastStatus = GM_getValue(LS.lastStatus, {});
@@ -89,6 +252,15 @@
     GM_setValue(LS.lastStatus, lastStatus);
     alert(ids.length ? `Watching ${ids.length} player(s): ${ids.join(', ')}` : 'Watch list cleared.');
   });
+
+  function toggleWatched(id, enabled) {
+    const list = getWatchList();
+    const entry = list.find((e) => e.id === id);
+    if (!entry) return;
+    entry.enabled = enabled;
+    GM_setValue(LS.watchList, list);
+    console.log(`[TLW] ${enabled ? 'Enabled' : 'Disabled'} monitoring for #${id}`);
+  }
 
   // ════════════════════════════════════════════════════════════
   //  RATE-GATED HTTP
@@ -183,6 +355,7 @@
       onclick: () => window.focus(),
     });
     console.log(`[TLW] ${curr.name} (${curr.id}): ${prev.state} -> ${curr.state} — ${curr.description}`);
+    sendTransientDiscordAlert(`🔔 **${curr.name}**: ${prev.state} → ${curr.state}${curr.description ? ` (${curr.description})` : ''}`);
   }
 
   // Fired for the first observation of a player (on Start, or when newly
@@ -205,7 +378,7 @@
   let playerRotationIndex = 0;
 
   function nextPlayerId() {
-    const ids = getWatchList();
+    const ids = getEnabledIds();
     if (ids.length === 0) return null;
     const id = ids[playerRotationIndex % ids.length];
     playerRotationIndex++;
@@ -235,6 +408,11 @@
         lastStatus[id] = { name: curr.name, state: curr.state, description: curr.description };
         GM_setValue(LS.lastStatus, lastStatus);
       }
+      // Runs from this tab only (the poll loop's leader), so it can't
+      // double-fire the way a cross-tab GM_addValueChangeListener would —
+      // unlike the on-page panel, we don't want every open tab editing the
+      // same Discord message independently.
+      syncDiscordMessage();
     } catch (e) {
       console.warn(`[TLW] Failed to fetch status for ${id}:`, e.message);
     }
@@ -301,24 +479,49 @@
       return;
     }
     panel.style.display = 'block';
+    panel.innerHTML = '';
 
-    const ids = getWatchList();
+    const header = document.createElement('div');
+    header.style.cssText = 'font-weight:bold;margin-bottom:4px;';
+    header.textContent = '📍 Location Watch';
+    panel.appendChild(header);
+
+    const list = getWatchList();
     const lastStatus = GM_getValue(LS.lastStatus, {});
 
-    let html = '<div style="font-weight:bold;margin-bottom:4px;">📍 Location Watch</div>';
-    if (ids.length === 0) {
-      html += '<div style="opacity:0.7">No players watched.</div>';
-    } else {
-      for (const id of ids) {
-        const s = lastStatus[id];
-        const name = escapeHtml((s && s.name) || `#${id}`);
-        const line = s
-          ? escapeHtml(`${s.state}${s.description ? ' — ' + s.description : ''}`)
-          : '<span style="opacity:0.7">checking...</span>';
-        html += `<div><b>${name}</b>: ${line}</div>`;
-      }
+    if (list.length === 0) {
+      const empty = document.createElement('div');
+      empty.style.opacity = '0.7';
+      empty.textContent = 'No players watched.';
+      panel.appendChild(empty);
+      return;
     }
-    panel.innerHTML = html;
+
+    list.forEach((entry) => {
+      const row = document.createElement('div');
+      row.style.cssText = 'display:flex;align-items:flex-start;gap:6px;padding:2px 0;';
+
+      const checkbox = document.createElement('input');
+      checkbox.type = 'checkbox';
+      checkbox.checked = entry.enabled;
+      checkbox.title = entry.enabled ? 'Uncheck to stop monitoring' : 'Check to resume monitoring';
+      checkbox.style.cssText = 'cursor:pointer;flex-shrink:0;margin-top:2px;';
+      checkbox.addEventListener('change', () => toggleWatched(entry.id, checkbox.checked));
+
+      const s = lastStatus[entry.id];
+      const name = escapeHtml((s && s.name) || `#${entry.id}`);
+      const line = s
+        ? escapeHtml(formatStatusLine(s.state, s.description))
+        : '<span style="opacity:0.7">checking...</span>';
+
+      const label = document.createElement('div');
+      label.style.cssText = entry.enabled ? '' : 'opacity:0.4;text-decoration:line-through;';
+      label.innerHTML = `<b>${name}</b>: ${line}`;
+
+      row.appendChild(checkbox);
+      row.appendChild(label);
+      panel.appendChild(row);
+    });
   }
 
   // Any tab (leader or not) re-renders whenever the shared state changes,
