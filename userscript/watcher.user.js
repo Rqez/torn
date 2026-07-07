@@ -22,7 +22,7 @@
   // ════════════════════════════════════════════════════════════
 
   const CONFIG = {
-    pollIntervalMs: 1_000,   // how often to re-check every watched player
+    pollIntervalMs: 3_000,   // how often to re-check every watched player
     perRequestDelayMs: 800,  // gap between calls REUSING THE SAME key (Torn's soft limit is ~100/min/key)
     maxApiKeys: 10,
   };
