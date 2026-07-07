@@ -47,6 +47,7 @@
     deviceName: 'tlw_device_name',
     jsonbinId: 'tlw_jsonbin_id',
     jsonbinKey: 'tlw_jsonbin_key',
+    showDisabled: 'tlw_show_disabled', // panel-only: whether unchecked players are shown at all
   };
 
   const TAB_ID = Math.random().toString(36).slice(2, 10);
@@ -133,7 +134,8 @@
   // watching Discord only sees who's actually being monitored right now.
   function buildDiscordContent() {
     const list = getWatchList().filter((e) => e.enabled);
-    if (list.length === 0) return '📍 **Location Watch** — no players currently checked.';
+    const footer = `_from: ${getDeviceName()}_`;
+    if (list.length === 0) return `📍 **Location Watch** — no players currently checked.\n${footer}`;
     const lastStatus = GM_getValue(LS.lastStatus, {});
     const lines = list.map((entry) => {
       const s = lastStatus[entry.id];
@@ -141,7 +143,7 @@
       const line = s ? formatStatusLine(s.state, s.description) : 'checking...';
       return `**${name}**: ${line}`;
     });
-    return `📍 **Location Watch**\n${lines.join('\n')}`;
+    return `📍 **Location Watch**\n${lines.join('\n')}\n\n${footer}`;
   }
 
   function postNewDiscordMessage(webhook, content) {
@@ -311,6 +313,19 @@
     entry.enabled = enabled;
     GM_setValue(LS.watchList, list);
     console.log(`[TLW] ${enabled ? 'Enabled' : 'Disabled'} monitoring for #${id}`);
+  }
+
+  function removeWatched(id) {
+    const list = getWatchList().filter((e) => e.id !== id);
+    GM_setValue(LS.watchList, list);
+    const lastStatus = GM_getValue(LS.lastStatus, {});
+    delete lastStatus[id];
+    GM_setValue(LS.lastStatus, lastStatus);
+    console.log(`[TLW] Removed #${id} from the watch list.`);
+  }
+
+  function getShowDisabled() {
+    return GM_getValue(LS.showDisabled, true);
   }
 
   // ════════════════════════════════════════════════════════════
@@ -493,11 +508,12 @@
 
   // On-demand full refresh — checks every watched player right away instead
   // of waiting for the round-robin to reach them (which can take a while
-  // with a long watch list). Includes disabled/auto-unchecked players too,
-  // so this doubles as a quick way to see if someone auto-unchecked for
-  // inactivity has come back online, without permanently re-adding them to
-  // the rotation. Runs regardless of Start/Stop or which device is active,
-  // since it's a one-off manual action, not the background polling loop.
+  // with a long watch list). Re-checks (enables) EVERYONE first, including
+  // players previously auto-unchecked for inactivity, so the API actually
+  // re-evaluates them — checkInactivity() inside checkOnePlayer() then
+  // unchecks anyone still offline for over an hour based on the fresh data.
+  // Runs regardless of Start/Stop or which device is active, since it's a
+  // one-off manual action, not the background polling loop.
   GM_registerMenuCommand('🔄 Check All Players Now', async () => {
     if (getApiKeys().length === 0) {
       alert('Set at least one Torn API key first (Tampermonkey menu → "Set Torn API Keys").');
@@ -508,6 +524,10 @@
       alert('No players on the watch list yet.');
       return;
     }
+
+    list.forEach((e) => { e.enabled = true; });
+    GM_setValue(LS.watchList, list);
+
     console.log(`[TLW] Manually checking all ${list.length} player(s)...`);
     for (const entry of list) {
       try {
@@ -713,18 +733,41 @@
     panel.style.display = 'block';
     panel.innerHTML = '';
 
-    const header = document.createElement('div');
-    header.style.cssText = 'font-weight:bold;margin-bottom:4px;';
-    header.textContent = isDeviceActive ? '📍 Location Watch' : `📍 Location Watch (standing by — another device is active)`;
-    panel.appendChild(header);
+    const headerRow = document.createElement('div');
+    headerRow.style.cssText = 'display:flex;align-items:baseline;justify-content:space-between;margin-bottom:4px;gap:6px;';
 
-    const list = sortEnabledFirst(getWatchList());
+    const title = document.createElement('div');
+    title.style.cssText = 'font-weight:bold;';
+    title.textContent = isDeviceActive ? '📍 Location Watch' : '📍 Location Watch (standing by)';
+    headerRow.appendChild(title);
+
+    const showDisabled = getShowDisabled();
+    const toggleShow = document.createElement('span');
+    toggleShow.textContent = showDisabled ? 'hide unchecked' : 'show unchecked';
+    toggleShow.title = showDisabled ? 'Hide unchecked players from this panel' : 'Show unchecked players in this panel';
+    toggleShow.style.cssText = 'cursor:pointer;font-weight:normal;font-size:10px;opacity:0.6;text-decoration:underline;flex-shrink:0;';
+    toggleShow.addEventListener('click', () => {
+      GM_setValue(LS.showDisabled, !showDisabled);
+      renderPanel();
+    });
+    headerRow.appendChild(toggleShow);
+    panel.appendChild(headerRow);
+
+    const fullList = getWatchList();
+    const list = sortEnabledFirst(fullList).filter((e) => e.enabled || showDisabled);
     const lastStatus = GM_getValue(LS.lastStatus, {});
 
-    if (list.length === 0) {
+    if (fullList.length === 0) {
       const empty = document.createElement('div');
       empty.style.opacity = '0.7';
       empty.textContent = 'No players watched.';
+      panel.appendChild(empty);
+      return;
+    }
+    if (list.length === 0) {
+      const empty = document.createElement('div');
+      empty.style.opacity = '0.7';
+      empty.textContent = 'All unchecked (hidden — click "show unchecked" above).';
       panel.appendChild(empty);
       return;
     }
@@ -741,17 +784,27 @@
       checkbox.addEventListener('change', () => toggleWatched(entry.id, checkbox.checked));
 
       const s = lastStatus[entry.id];
-      const name = escapeHtml((s && s.name) || `#${entry.id}`);
+      const rawName = (s && s.name) || `#${entry.id}`;
+      const name = escapeHtml(rawName);
       const line = s
         ? escapeHtml(formatStatusLine(s.state, s.description))
         : '<span style="opacity:0.7">checking...</span>';
 
       const label = document.createElement('div');
-      label.style.cssText = entry.enabled ? '' : 'opacity:0.4;text-decoration:line-through;';
+      label.style.cssText = (entry.enabled ? '' : 'opacity:0.4;text-decoration:line-through;') + 'flex:1;min-width:0;';
       label.innerHTML = `<b>${name}</b>: ${line}`;
+
+      const trash = document.createElement('span');
+      trash.textContent = '🗑️';
+      trash.title = 'Remove from watch list';
+      trash.style.cssText = 'cursor:pointer;flex-shrink:0;margin-left:auto;opacity:0.6;';
+      trash.addEventListener('click', () => {
+        if (confirm(`Remove ${rawName} (#${entry.id}) from the watch list?`)) removeWatched(entry.id);
+      });
 
       row.appendChild(checkbox);
       row.appendChild(label);
+      row.appendChild(trash);
       panel.appendChild(row);
     });
   }
