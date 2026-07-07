@@ -76,6 +76,21 @@
     alert(keys.length ? `Saved ${keys.length} API key(s).` : 'API keys cleared.');
   });
 
+  // Quicker than editing the full comma-separated list above — just types
+  // one new key into a fresh, empty prompt.
+  GM_registerMenuCommand('➕ Add One Torn API Key', () => {
+    const key = prompt('Enter one Torn API key to add:', '');
+    if (key == null || !key.trim()) return;
+    const keys = getApiKeys();
+    if (keys.length >= CONFIG.maxApiKeys) {
+      alert(`Already at the max of ${CONFIG.maxApiKeys} keys. Remove one via "Set Torn API Keys" first.`);
+      return;
+    }
+    keys.push(key.trim());
+    GM_setValue(LS.apiKeys, keys);
+    alert(`Added. Now have ${keys.length} key(s).`);
+  });
+
   // ════════════════════════════════════════════════════════════
   //  DISCORD RELAY — optional. Instead of posting a new message per event,
   //  this keeps ONE message alive and edits it in place, mirroring the
@@ -112,18 +127,19 @@
     return `${state}${description ? ' — ' + description : ''}`;
   }
 
-  // Builds the same status list the on-page panel shows, as Discord markdown.
-  // Disabled players are struck through, same as the panel dims them.
+  // Builds the Discord dashboard content. Unlike the on-page panel (which
+  // shows disabled players dimmed, since it needs to display their checkbox),
+  // unchecked/disabled players are left out of this entirely — a friend
+  // watching Discord only sees who's actually being monitored right now.
   function buildDiscordContent() {
-    const list = getWatchList();
-    if (list.length === 0) return '📍 **Location Watch** — no players watched.';
+    const list = getWatchList().filter((e) => e.enabled);
+    if (list.length === 0) return '📍 **Location Watch** — no players currently checked.';
     const lastStatus = GM_getValue(LS.lastStatus, {});
     const lines = list.map((entry) => {
       const s = lastStatus[entry.id];
       const name = (s && s.name) || `#${entry.id}`;
       const line = s ? formatStatusLine(s.state, s.description) : 'checking...';
-      const text = `**${name}**: ${line}`;
-      return entry.enabled ? text : `~~${text}~~`;
+      return `**${name}**: ${line}`;
     });
     return `📍 **Location Watch**\n${lines.join('\n')}`;
   }
@@ -237,6 +253,13 @@
     return getWatchList().filter((e) => e.enabled).map((e) => e.id);
   }
 
+  // Display-only ordering (doesn't touch storage): enabled players first,
+  // disabled ones (including auto-unchecked-for-inactivity) sink to the
+  // bottom, each group keeping its original relative order.
+  function sortEnabledFirst(list) {
+    return [...list].sort((a, b) => (b.enabled ? 1 : 0) - (a.enabled ? 1 : 0));
+  }
+
   GM_registerMenuCommand('📋 Set Watched Player IDs', () => {
     const current = getWatchList().map((e) => e.id).join(', ');
     const input = prompt('Enter player IDs to watch, comma-separated (e.g. 1234567, 2345678):', current);
@@ -259,6 +282,26 @@
     }
     GM_setValue(LS.lastStatus, lastStatus);
     alert(ids.length ? `Watching ${ids.length} player(s): ${ids.join(', ')}` : 'Watch list cleared.');
+  });
+
+  // Quicker than editing the full comma-separated list above — just types
+  // one new ID into a fresh, empty prompt, enabled by default.
+  GM_registerMenuCommand('➕ Add One Watched Player ID', () => {
+    const input = prompt('Enter one player ID to add:', '');
+    if (input == null || !input.trim()) return;
+    const id = parseInt(input.trim(), 10);
+    if (!Number.isFinite(id) || id <= 0) {
+      alert('That doesn\'t look like a valid player ID.');
+      return;
+    }
+    const list = getWatchList();
+    if (list.some((e) => e.id === id)) {
+      alert(`#${id} is already on the watch list.`);
+      return;
+    }
+    list.push({ id, enabled: true });
+    GM_setValue(LS.watchList, list);
+    alert(`Added #${id}. Now watching ${list.length} player(s).`);
   });
 
   function toggleWatched(id, enabled) {
@@ -340,6 +383,10 @@
   // solid ground than the market "quality" field we had to verify earlier —
   // but if the console logs "Unexpected profile response", paste it back and
   // I'll adjust the field names below.
+  //
+  // Also reads profile.last_action = { status: "Online"|"Idle"|"Offline",
+  // timestamp, relative } — another long-standing, well-documented part of
+  // Torn's API — to drive the auto-uncheck-after-inactivity feature below.
   async function fetchStatus(id) {
     const data = await apiGet(`/user/${id}?selections=profile`);
     const profile = data.profile;
@@ -352,16 +399,33 @@
       name: profile.name || `#${id}`,
       state: profile.status.state,
       description: profile.status.description,
+      lastActionStatus: profile.last_action ? profile.last_action.status : null,
+      lastActionTimestamp: profile.last_action ? profile.last_action.timestamp : null,
     };
   }
 
+  const INACTIVITY_TTL_SEC = 60 * 60; // auto-uncheck after this long offline
+
+  // Auto-disables (unchecks) a player once they've been Offline for over an
+  // hour — they still stay on the list (and can be manually re-checked
+  // anytime), just stop consuming a check-slot in the round-robin. Doesn't
+  // re-enable them automatically if they come back online, since a disabled
+  // player is no longer being checked at all.
+  function checkInactivity(curr) {
+    if (curr.lastActionStatus !== 'Offline' || !curr.lastActionTimestamp) return;
+    const offlineSec = Date.now() / 1000 - curr.lastActionTimestamp;
+    if (offlineSec <= INACTIVITY_TTL_SEC) return;
+
+    const list = getWatchList();
+    const entry = list.find((e) => e.id === curr.id);
+    if (entry && entry.enabled) {
+      entry.enabled = false;
+      GM_setValue(LS.watchList, list);
+      console.log(`[TLW] Auto-unchecked ${curr.name} (#${curr.id}) — offline for over 1 hour.`);
+    }
+  }
+
   function notifyChange(prev, curr) {
-    GM_notification({
-      title: `${curr.name}: status changed`,
-      text: `${prev.state} → ${curr.state}${curr.description ? ` (${curr.description})` : ''}`,
-      timeout: 20000,
-      onclick: () => window.focus(),
-    });
     console.log(`[TLW] ${curr.name} (${curr.id}): ${prev.state} -> ${curr.state} — ${curr.description}`);
     sendTransientDiscordAlert(`🔔 **${curr.name}**: ${prev.state} → ${curr.state}${curr.description ? ` (${curr.description})` : ''}`);
   }
@@ -416,6 +480,7 @@
         lastStatus[id] = { name: curr.name, state: curr.state, description: curr.description };
         GM_setValue(LS.lastStatus, lastStatus);
       }
+      checkInactivity(curr);
       // Runs from this tab only (the poll loop's leader), so it can't
       // double-fire the way a cross-tab GM_addValueChangeListener would —
       // unlike the on-page panel, we don't want every open tab editing the
@@ -425,6 +490,34 @@
       console.warn(`[TLW] Failed to fetch status for ${id}:`, e.message);
     }
   }
+
+  // On-demand full refresh — checks every watched player right away instead
+  // of waiting for the round-robin to reach them (which can take a while
+  // with a long watch list). Includes disabled/auto-unchecked players too,
+  // so this doubles as a quick way to see if someone auto-unchecked for
+  // inactivity has come back online, without permanently re-adding them to
+  // the rotation. Runs regardless of Start/Stop or which device is active,
+  // since it's a one-off manual action, not the background polling loop.
+  GM_registerMenuCommand('🔄 Check All Players Now', async () => {
+    if (getApiKeys().length === 0) {
+      alert('Set at least one Torn API key first (Tampermonkey menu → "Set Torn API Keys").');
+      return;
+    }
+    const list = getWatchList();
+    if (list.length === 0) {
+      alert('No players on the watch list yet.');
+      return;
+    }
+    console.log(`[TLW] Manually checking all ${list.length} player(s)...`);
+    for (const entry of list) {
+      try {
+        await checkOnePlayer(entry.id);
+      } catch (e) {
+        console.error(`[TLW] Manual check failed for #${entry.id}:`, e.message);
+      }
+    }
+    console.log('[TLW] Manual check-all complete.');
+  });
 
   // ════════════════════════════════════════════════════════════
   //  LEADER LOCK — avoid duplicate polling/API calls across multiple open tabs
@@ -625,7 +718,7 @@
     header.textContent = isDeviceActive ? '📍 Location Watch' : `📍 Location Watch (standing by — another device is active)`;
     panel.appendChild(header);
 
-    const list = getWatchList();
+    const list = sortEnabledFirst(getWatchList());
     const lastStatus = GM_getValue(LS.lastStatus, {});
 
     if (list.length === 0) {
