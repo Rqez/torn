@@ -103,7 +103,7 @@
     return GM_getValue(LS.discordWebhook, '');
   }
 
-  GM_registerMenuCommand('🔔 Set Discord Webhook (for friend)', () => {
+  GM_registerMenuCommand('🔔 Set Discord Webhook (for friend)', async () => {
     const current = getDiscordWebhook();
     const url = prompt(
       "Enter a Discord webhook URL to relay a live status dashboard to a friend's channel (Discord: Channel Settings → Integrations → Webhooks → New Webhook → Copy URL). Leave blank to disable:",
@@ -111,7 +111,7 @@
     );
     if (url == null) return;
     GM_setValue(LS.discordWebhook, url.trim());
-    GM_setValue(LS.discordMessageId, null); // start a fresh message under the new webhook
+    await setSharedDiscordMessageId(null); // start a fresh message under the new webhook
     alert(url.trim() ? 'Discord webhook saved.' : 'Discord webhook cleared — alerts will only show locally.');
   });
 
@@ -146,54 +146,96 @@
     return `📍 **Location Watch**\n${lines.join('\n')}\n\n${footer}`;
   }
 
+  // The message ID to edit has to be shared across devices too, not just
+  // the polling lock — otherwise each device remembers its own separate
+  // message from whenever it was last active, and you end up with one
+  // dashboard message per device instead of one overall. When a
+  // cross-device lock is configured, this piggybacks on the same shared
+  // jsonbin record (alongside owner/name/ts) instead of local GM storage.
+  //
+  // It deliberately does NOT fetch jsonbin on every call — sharedRecordCache
+  // (populated by the lock heartbeat in refreshDeviceLockIfDue, which already
+  // reads the same record every ~15s) is reused instead, since a message id
+  // essentially never changes and jsonbin's free tier has a tight request
+  // quota. A stale-by-up-to-15s read of the id is harmless.
+  async function getSharedDiscordMessageId() {
+    if (!GM_getValue(LS.jsonbinId, '') || !GM_getValue(LS.jsonbinKey, '')) {
+      return GM_getValue(LS.discordMessageId, null);
+    }
+    if (!sharedRecordCache) sharedRecordCache = await jsonbinGet();
+    return (sharedRecordCache && sharedRecordCache.discordMessageId) || null;
+  }
+
+  // Only called when the id actually needs to change (first-ever post, or
+  // after a 404) — rare, so an extra jsonbin round trip here is fine. Merges
+  // into the cached record rather than overwriting it, so it doesn't clobber
+  // the owner/name/ts fields the lock heartbeat also lives in.
+  async function setSharedDiscordMessageId(id) {
+    if (!GM_getValue(LS.jsonbinId, '') || !GM_getValue(LS.jsonbinKey, '')) {
+      GM_setValue(LS.discordMessageId, id);
+      return;
+    }
+    const record = sharedRecordCache || (await jsonbinGet()) || {};
+    record.discordMessageId = id;
+    await jsonbinPut(record);
+    sharedRecordCache = record;
+  }
+
   function postNewDiscordMessage(webhook, content) {
-    GM_xmlhttpRequest({
-      method: 'POST',
-      url: `${webhook}?wait=true`,
-      headers: { 'Content-Type': 'application/json' },
-      data: JSON.stringify({ content }),
-      onload: (r) => {
-        if (r.status < 200 || r.status >= 300) {
-          console.warn(`[TLW] Discord post failed: HTTP ${r.status} — ${r.responseText.slice(0, 200)}`);
-          return;
-        }
-        try {
-          const msg = JSON.parse(r.responseText);
-          if (msg.id) GM_setValue(LS.discordMessageId, msg.id);
-        } catch {
-          console.warn('[TLW] Discord post succeeded but response could not be parsed for message id.');
-        }
-      },
-      onerror: () => console.warn('[TLW] Discord post request failed (network error).'),
+    return new Promise((resolve) => {
+      GM_xmlhttpRequest({
+        method: 'POST',
+        url: `${webhook}?wait=true`,
+        headers: { 'Content-Type': 'application/json' },
+        data: JSON.stringify({ content }),
+        onload: async (r) => {
+          if (r.status < 200 || r.status >= 300) {
+            console.warn(`[TLW] Discord post failed: HTTP ${r.status} — ${r.responseText.slice(0, 200)}`);
+            resolve();
+            return;
+          }
+          try {
+            const msg = JSON.parse(r.responseText);
+            if (msg.id) await setSharedDiscordMessageId(msg.id);
+          } catch {
+            console.warn('[TLW] Discord post succeeded but response could not be parsed for message id.');
+          }
+          resolve();
+        },
+        onerror: () => { console.warn('[TLW] Discord post request failed (network error).'); resolve(); },
+      });
     });
   }
 
-  function syncDiscordMessage() {
+  async function syncDiscordMessage() {
     const webhook = getDiscordWebhook();
     if (!webhook) return;
     const content = buildDiscordContent();
-    const messageId = GM_getValue(LS.discordMessageId, null);
+    const messageId = await getSharedDiscordMessageId();
 
     if (!messageId) {
-      postNewDiscordMessage(webhook, content);
+      await postNewDiscordMessage(webhook, content);
       return;
     }
 
-    GM_xmlhttpRequest({
-      method: 'PATCH',
-      url: `${webhook}/messages/${messageId}`,
-      headers: { 'Content-Type': 'application/json' },
-      data: JSON.stringify({ content }),
-      onload: (r) => {
-        if (r.status === 404) {
-          // The message was deleted on Discord's side — start a new one.
-          GM_setValue(LS.discordMessageId, null);
-          postNewDiscordMessage(webhook, content);
-        } else if (r.status < 200 || r.status >= 300) {
-          console.warn(`[TLW] Discord edit failed: HTTP ${r.status} — ${r.responseText.slice(0, 200)}`);
-        }
-      },
-      onerror: () => console.warn('[TLW] Discord edit request failed (network error).'),
+    await new Promise((resolve) => {
+      GM_xmlhttpRequest({
+        method: 'PATCH',
+        url: `${webhook}/messages/${messageId}`,
+        headers: { 'Content-Type': 'application/json' },
+        data: JSON.stringify({ content }),
+        onload: async (r) => {
+          if (r.status === 404) {
+            // The message was deleted on Discord's side — start a new one.
+            await setSharedDiscordMessageId(null);
+            await postNewDiscordMessage(webhook, content);
+          } else if (r.status < 200 || r.status >= 300) {
+            console.warn(`[TLW] Discord edit failed: HTTP ${r.status} — ${r.responseText.slice(0, 200)}`);
+          }
+          resolve();
+        },
+        onerror: () => { console.warn('[TLW] Discord edit request failed (network error).'); resolve(); },
+      });
     });
   }
 
@@ -499,8 +541,9 @@
       // Runs from this tab only (the poll loop's leader), so it can't
       // double-fire the way a cross-tab GM_addValueChangeListener would —
       // unlike the on-page panel, we don't want every open tab editing the
-      // same Discord message independently.
-      syncDiscordMessage();
+      // same Discord message independently. Awaited since it now round-trips
+      // through the shared jsonbin record to resolve the shared message id.
+      await syncDiscordMessage();
     } catch (e) {
       console.warn(`[TLW] Failed to fetch status for ${id}:`, e.message);
     }
@@ -652,6 +695,12 @@
   let isDeviceActive = true;
   let lastDeviceLockCheckAt = 0;
 
+  // Last-known copy of the shared jsonbin record (owner/name/ts/
+  // discordMessageId), refreshed here every deviceHeartbeatMs. Shared with
+  // getSharedDiscordMessageId() above so it doesn't need its own separate
+  // (much more frequent) jsonbin reads.
+  let sharedRecordCache = null;
+
   async function refreshDeviceLockIfDue() {
     if (Date.now() - lastDeviceLockCheckAt < CONFIG.deviceHeartbeatMs) return;
     lastDeviceLockCheckAt = Date.now();
@@ -662,6 +711,7 @@
     }
 
     const remote = await jsonbinGet();
+    sharedRecordCache = remote;
     const now = Date.now();
     const deviceId = getDeviceId();
     const isFree = !remote || !remote.owner;
@@ -670,9 +720,13 @@
 
     const wasActive = isDeviceActive;
     if (isFree || isOurs || isStale) {
-      const ok = await jsonbinPut({ owner: deviceId, name: getDeviceName(), ts: now });
-      if (ok && !isOurs) {
-        console.log(`[TLW] This device (${getDeviceName()}) is now the active instance.`);
+      // Spread the existing record first so this heartbeat write doesn't
+      // clobber discordMessageId (set independently, only when it changes).
+      const updated = { ...(remote || {}), owner: deviceId, name: getDeviceName(), ts: now };
+      const ok = await jsonbinPut(updated);
+      if (ok) {
+        sharedRecordCache = updated;
+        if (!isOurs) console.log(`[TLW] This device (${getDeviceName()}) is now the active instance.`);
       }
       isDeviceActive = ok;
     } else {
