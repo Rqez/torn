@@ -12,7 +12,6 @@
 // @grant        GM_addValueChangeListener
 // @connect      api.torn.com
 // @run-at       document-idle
-// ==/UserScript==
 
 (function () {
   'use strict';
