@@ -23,13 +23,14 @@
 
   const CONFIG = {
     pollIntervalMs: 1_000,   // how often to re-check every watched player
-    perRequestDelayMs: 800,  // gap between individual API calls (Torn's soft limit is ~100/min)
+    perRequestDelayMs: 800,  // gap between calls REUSING THE SAME key (Torn's soft limit is ~100/min/key)
+    maxApiKeys: 10,
   };
 
   const API_BASE = 'https://api.torn.com/v2';
 
   const LS = {
-    apiKey: 'tlw_api_key',
+    apiKeys: 'tlw_api_keys', // array of up to CONFIG.maxApiKeys key strings, all on your own account
     watchList: 'tlw_watch_list',   // array of numeric player IDs
     lastStatus: 'tlw_last_status', // { [id]: { state, description } }
     running: 'tlw_running',
@@ -42,22 +43,25 @@
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
   // ════════════════════════════════════════════════════════════
-  //  API KEY
+  //  API KEYS — up to 10 keys, all generated from the same account, used
+  //  round-robin so each individual key stays well under Torn's per-key
+  //  rate limit even while polling frequently.
   // ════════════════════════════════════════════════════════════
 
-  function getApiKey() {
-    return GM_getValue(LS.apiKey, '');
+  function getApiKeys() {
+    return GM_getValue(LS.apiKeys, []);
   }
 
-  GM_registerMenuCommand('🔑 Set Torn API Key', () => {
-    const key = prompt(
-      'Enter your Torn API key (Public access is enough — generate one at torn.com/preferences.php#tab=api):',
-      getApiKey()
+  GM_registerMenuCommand(`🔑 Set Torn API Keys (up to ${CONFIG.maxApiKeys})`, () => {
+    const current = getApiKeys().join(', ');
+    const input = prompt(
+      `Enter up to ${CONFIG.maxApiKeys} Torn API keys, comma-separated (all from your own account — generate more at torn.com/preferences.php#tab=api):`,
+      current
     );
-    if (key && key.trim()) {
-      GM_setValue(LS.apiKey, key.trim());
-      alert('Torn API key saved.');
-    }
+    if (input == null) return;
+    const keys = input.split(',').map((s) => s.trim()).filter(Boolean).slice(0, CONFIG.maxApiKeys);
+    GM_setValue(LS.apiKeys, keys);
+    alert(keys.length ? `Saved ${keys.length} API key(s).` : 'API keys cleared.');
   });
 
   // ════════════════════════════════════════════════════════════
@@ -90,7 +94,19 @@
   //  RATE-GATED HTTP
   // ════════════════════════════════════════════════════════════
 
-  let lastRequestAt = 0;
+  // Rate gating is per-key, not global — calls reusing the same key still
+  // wait perRequestDelayMs apart, but rotating to a different key can fire
+  // immediately, since each key has its own independent Torn rate budget.
+  let rotationIndex = 0;
+  const lastRequestByKey = {};
+
+  function nextApiKey() {
+    const keys = getApiKeys();
+    if (keys.length === 0) return null;
+    const key = keys[rotationIndex % keys.length];
+    rotationIndex++;
+    return key;
+  }
 
   function gmGet(url) {
     return new Promise((resolve, reject) => {
@@ -105,11 +121,17 @@
   }
 
   async function apiGet(path) {
-    const wait = CONFIG.perRequestDelayMs - (Date.now() - lastRequestAt);
-    if (wait > 0) await sleep(wait);
-    lastRequestAt = Date.now();
+    const key = nextApiKey();
+    if (!key) throw new Error('no_api_keys');
 
-    const key = getApiKey();
+    const lastForThisKey = lastRequestByKey[key] || 0;
+    const wait = CONFIG.perRequestDelayMs - (Date.now() - lastForThisKey);
+    if (wait > 0) await sleep(wait);
+    lastRequestByKey[key] = Date.now();
+
+    const keySlot = getApiKeys().indexOf(key) + 1;
+    console.log(`[TLW] API call: ${path} @ ${new Date(lastRequestByKey[key]).toLocaleTimeString()} (key #${keySlot})`);
+
     const url = `${API_BASE}${path}${path.includes('?') ? '&' : '?'}key=${encodeURIComponent(key)}`;
     const res = await gmGet(url);
     if (res.status < 200 || res.status >= 300) {
@@ -207,6 +229,10 @@
       } catch (e) {
         console.warn(`[TLW] Failed to fetch status for ${id}:`, e.message);
       }
+      // Refresh per-ID, not just once per cycle — with a short poll interval
+      // and enough watched players, a full pass can outlast LOCK_TTL_MS,
+      // which would otherwise let another open tab steal the lock mid-cycle.
+      refreshLock();
     }
   }
 
@@ -308,8 +334,8 @@
 
   async function loop() {
     while (isRunning()) {
-      if (!getApiKey()) {
-        console.warn('[TLW] No API key set. Use the Tampermonkey menu "Set Torn API Key".');
+      if (getApiKeys().length === 0) {
+        console.warn('[TLW] No API keys set. Use the Tampermonkey menu "Set Torn API Keys".');
         await sleep(CONFIG.pollIntervalMs);
         continue;
       }
@@ -335,8 +361,8 @@
 
   GM_registerMenuCommand('▶ Start Location Watch', () => {
     if (isRunning()) return;
-    if (!getApiKey()) {
-      alert('Set your Torn API key first (Tampermonkey menu → "Set Torn API Key").');
+    if (getApiKeys().length === 0) {
+      alert('Set at least one Torn API key first (Tampermonkey menu → "Set Torn API Keys").');
       return;
     }
     if (getWatchList().length === 0) {
