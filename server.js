@@ -51,7 +51,11 @@ const DEVICE_LOCK_TTL_MS = 3 * JSONBIN_SYNC_INTERVAL_MS; // 30 min grace before 
 const DEFAULT_DEVICE_PRIORITY = 100; // matches the browser script's default
 const SERVER_DEVICE_ID = 'render-server-1'; // FIXED — must survive restarts so it can immediately reclaim its own lock
 const SERVER_DEVICE_NAME = 'Render Server';
-const SERVER_PRIORITY = 1; // better (lower) than the browser script's default of 100 — this always wins when online
+// Worse (higher) than the browser script's default of 100 — this is now the
+// fallback of last resort: it only takes over once every laptop using the
+// default priority has gone stale (no heartbeat for DEVICE_LOCK_TTL_MS), and
+// steps back down the moment a laptop reclaims the lock.
+const SERVER_PRIORITY = 101;
 
 if (!JSONBIN_ID || !JSONBIN_KEY) {
   console.error('[FATAL] Set JSONBIN_ID and JSONBIN_KEY environment variables (Render dashboard → Environment).');
