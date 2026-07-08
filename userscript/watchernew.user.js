@@ -42,6 +42,16 @@
   const API_BASE = 'https://api.torn.com/v2';
   const JSONBIN_BASE = 'https://api.jsonbin.io/v3/b';
 
+  // Embedded directly rather than configured per-device via the Tampermonkey
+  // menu — every device (and the always-on server) shares one jsonbin bin
+  // and one Discord webhook, so there's nothing left to set per-install.
+  // NOTE: these are live credentials. Anyone with a copy of this file has
+  // full read/write access to the jsonbin bin and can post/delete messages
+  // via the webhook — don't commit this file to a public repo.
+  const EMBEDDED_JSONBIN_ID = '6a4d530dda38895dfe3c7b05';
+  const EMBEDDED_JSONBIN_KEY = '$2a$10$sKu60s9KQG.HgFjY.cB5HeiWcA8xdJKpHM1wBGt4NjdbqPdrIr5fe';
+  const EMBEDDED_DISCORD_WEBHOOK = 'https://discord.com/api/webhooks/1524111939754524672/NsekHui8ycey4215OFyDNCVxPOr5HxlJ7JE18y5ugvaIHmczAD91fV1L0zabVYo0DBa4';
+
   const LS = {
     apiKeys: 'tlw_api_keys', // array of up to CONFIG.maxApiKeys key strings, all on your own account
     apiKeysUpdatedAt: 'tlw_api_keys_updated_at',
@@ -50,14 +60,9 @@
     lastStatus: 'tlw_last_status', // { [id]: { state, description } }
     running: 'tlw_running',
     lock: 'tlw_lock',
-    discordWebhook: 'tlw_discord_webhook',
-    discordMessageId: 'tlw_discord_message_id',
-    discordWebhookUpdatedAt: 'tlw_discord_webhook_updated_at',
     deviceId: 'tlw_device_id',
     deviceName: 'tlw_device_name',
     devicePriority: 'tlw_device_priority', // lower number = higher priority; default (unset) = 100
-    jsonbinId: 'tlw_jsonbin_id',
-    jsonbinKey: 'tlw_jsonbin_key',
     showDisabled: 'tlw_show_disabled', // panel-only: whether unchecked players are shown at all
   };
 
@@ -103,53 +108,46 @@
   // Quicker than editing the full comma-separated list above — just types
   // one new key into a fresh, empty prompt. Lives as a button in the on-page
   // panel rather than the Tampermonkey menu (see the panel's action row).
-  function addOneApiKey() {
+  // Union of two key lists, de-duplicated, capped at maxApiKeys.
+  function mergeApiKeys(a, b) {
+    return Array.from(new Set([...b, ...a])).slice(0, CONFIG.maxApiKeys);
+  }
+
+  async function addOneApiKey() {
     const key = prompt('Enter one Torn API key to add:', '');
     if (key == null || !key.trim()) return;
-    const keys = getApiKeys();
-    if (keys.length >= CONFIG.maxApiKeys) {
+    const trimmed = key.trim();
+
+    // Pull the freshest remote list first and merge in, instead of pushing
+    // this device's possibly-stale local list — a plain setApiKeys() here
+    // would risk silently overwriting a key added on another device since
+    // this one last synced (the last-write-wins risk noted above).
+    const remote = await jsonbinGet();
+    const merged = mergeApiKeys(getApiKeys(), (remote && remote.apiKeys) || []);
+
+    if (merged.includes(trimmed)) {
+      setApiKeys(merged);
+      alert(`That key is already saved. Now have ${merged.length} key(s) total.`);
+      return;
+    }
+    if (merged.length >= CONFIG.maxApiKeys) {
       alert(`Already at the max of ${CONFIG.maxApiKeys} keys. Remove one via "Set Torn API Keys" first.`);
       return;
     }
-    keys.push(key.trim());
-    setApiKeys(keys);
-    alert(`Added. Now have ${keys.length} key(s).`);
+    merged.push(trimmed);
+    setApiKeys(merged);
+    alert(`Added. Now have ${merged.length} key(s) total.`);
   }
 
   // ════════════════════════════════════════════════════════════
-  //  DISCORD RELAY — optional. Instead of posting a new message per event,
-  //  this keeps ONE message alive and edits it in place, mirroring the
-  //  on-page panel — a friend watching that Discord channel sees the same
-  //  always-current dashboard, not a growing feed of separate alerts.
+  //  DISCORD RELAY — keeps ONE message alive and edits it in place,
+  //  mirroring the on-page panel — a friend watching that Discord channel
+  //  sees the same always-current dashboard, not a growing feed of alerts.
   // ════════════════════════════════════════════════════════════
 
   function getDiscordWebhook() {
-    return GM_getValue(LS.discordWebhook, '');
+    return EMBEDDED_DISCORD_WEBHOOK;
   }
-
-  // Central setter (same reasoning as setApiKeys()/setWatchList()) — pushes
-  // to the shared jsonbin record so other devices, INCLUDING the always-on
-  // server, pick it up. Previously this only ever wrote local GM storage,
-  // which meant the server (which only ever reads sharedRecord.discordWebhook)
-  // never saw a webhook set from a laptop at all — it silently no-op'd on
-  // every Discord call since the webhook always read as empty.
-  function setDiscordWebhook(url) {
-    GM_setValue(LS.discordWebhook, url);
-    GM_setValue(LS.discordWebhookUpdatedAt, Date.now());
-    pushConfigToShared();
-  }
-
-  GM_registerMenuCommand('🔔 Set Discord Webhook (for friend)', async () => {
-    const current = getDiscordWebhook();
-    const url = prompt(
-      "Enter a Discord webhook URL to relay a live status dashboard to a friend's channel (Discord: Channel Settings → Integrations → Webhooks → New Webhook → Copy URL). Leave blank to disable:",
-      current
-    );
-    if (url == null) return;
-    setDiscordWebhook(url.trim());
-    await setSharedDiscordMessageId(null); // start a fresh message under the new webhook
-    alert(url.trim() ? 'Discord webhook saved.' : 'Discord webhook cleared — alerts will only show locally.');
-  });
 
   // Torn's description is sometimes just a repeat of state (e.g. state="Okay",
   // description="Okay"), which reads as a redundant "Okay — Okay". When that
@@ -185,9 +183,9 @@
   // The message ID to edit has to be shared across devices too, not just
   // the polling lock — otherwise each device remembers its own separate
   // message from whenever it was last active, and you end up with one
-  // dashboard message per device instead of one overall. When a
-  // cross-device lock is configured, this piggybacks on the same shared
-  // jsonbin record (alongside owner/name/ts) instead of local GM storage.
+  // dashboard message per device instead of one overall. Piggybacks on the
+  // same shared jsonbin record (alongside owner/name/ts) instead of local
+  // GM storage.
   //
   // It deliberately does NOT fetch jsonbin on every call — sharedRecordCache
   // (populated by the lock heartbeat in refreshDeviceLockIfDue, which already
@@ -196,9 +194,6 @@
   // a tight request quota. A stale-by-up-to-one-heartbeat read of the id is
   // harmless.
   async function getSharedDiscordMessageId() {
-    if (!GM_getValue(LS.jsonbinId, '') || !GM_getValue(LS.jsonbinKey, '')) {
-      return GM_getValue(LS.discordMessageId, null);
-    }
     if (!sharedRecordCache) sharedRecordCache = await jsonbinGet();
     return (sharedRecordCache && sharedRecordCache.discordMessageId) || null;
   }
@@ -208,10 +203,6 @@
   // into the cached record rather than overwriting it, so it doesn't clobber
   // the owner/name/ts fields the lock heartbeat also lives in.
   async function setSharedDiscordMessageId(id) {
-    if (!GM_getValue(LS.jsonbinId, '') || !GM_getValue(LS.jsonbinKey, '')) {
-      GM_setValue(LS.discordMessageId, id);
-      return;
-    }
     const record = sharedRecordCache || (await jsonbinGet()) || {};
     record.discordMessageId = id;
     await jsonbinPut(record);
@@ -376,7 +367,18 @@
   // Quicker than editing the full comma-separated list above — just types
   // one new ID into a fresh, empty prompt, enabled by default. Lives as a
   // button in the on-page panel rather than the Tampermonkey menu.
-  function addOneWatchedId() {
+  //
+  // Union of two watch lists by id, de-duplicated — the entry from `a`
+  // (the more "authoritative" side, i.e. remote when merging in a pull, or
+  // local-plus-the-new-entry when pushing) wins on conflicts.
+  function mergeWatchLists(a, b) {
+    const map = new Map();
+    b.forEach((e) => map.set(e.id, e));
+    a.forEach((e) => map.set(e.id, e));
+    return Array.from(map.values());
+  }
+
+  async function addOneWatchedId() {
     const input = prompt('Enter one player ID to add:', '');
     if (input == null || !input.trim()) return;
     const id = parseInt(input.trim(), 10);
@@ -384,14 +386,22 @@
       alert('That doesn\'t look like a valid player ID.');
       return;
     }
-    const list = getWatchList();
-    if (list.some((e) => e.id === id)) {
-      alert(`#${id} is already on the watch list.`);
+
+    // Pull the freshest remote list first and merge in, instead of pushing
+    // this device's possibly-stale local list — a plain setWatchList() here
+    // would risk silently overwriting a player added on another device
+    // since this one last synced (the last-write-wins risk noted above).
+    const remote = await jsonbinGet();
+    const merged = mergeWatchLists(getWatchList(), (remote && remote.watchList) || []);
+
+    if (merged.some((e) => e.id === id)) {
+      setWatchList(merged);
+      alert(`#${id} is already on the watch list. Now watching ${merged.length} player(s) total.`);
       return;
     }
-    list.push({ id, enabled: true });
-    setWatchList(list);
-    alert(`Added #${id}. Now watching ${list.length} player(s).`);
+    merged.push({ id, enabled: true });
+    setWatchList(merged);
+    alert(`Added #${id}. Now watching ${merged.length} player(s) total.`);
   }
 
   function toggleWatched(id, enabled) {
@@ -446,6 +456,26 @@
     });
   }
 
+  // Notifies (once per key, until it recovers) when Torn's API rejects a key
+  // for a reason other than rate-limiting — incorrect/revoked/disabled key,
+  // owner in federal jail, etc. Code 5 (too many requests) is expected and
+  // transient with multiple keys rotating, so it's excluded on purpose.
+  const brokenApiKeys = new Set();
+
+  function maskKey(key) {
+    return key.length > 8 ? `${key.slice(0, 4)}…${key.slice(-4)}` : key;
+  }
+
+  function notifyKeyProblem(key, error) {
+    const masked = maskKey(key);
+    GM_notification({
+      title: 'Torn API key not working',
+      text: `Key ${masked}: ${error.error} (code ${error.code})`,
+      timeout: 20000,
+    });
+    console.warn(`[TLW] API key ${masked} appears broken: code ${error.code} — ${error.error}`);
+  }
+
   async function apiGet(path) {
     const key = nextApiKey();
     if (!key) throw new Error('no_api_keys');
@@ -470,8 +500,13 @@
       throw new Error(`Non-JSON response for ${path}: ${res.responseText.slice(0, 200)}`);
     }
     if (data && data.error) {
+      if (data.error.code !== 5 && !brokenApiKeys.has(key)) {
+        brokenApiKeys.add(key);
+        notifyKeyProblem(key, data.error);
+      }
       throw new Error(`Torn API error ${data.error.code}: ${data.error.error}`);
     }
+    brokenApiKeys.delete(key); // recovered — allow re-notifying if it breaks again later
     return data;
   }
 
@@ -659,9 +694,9 @@
   //
   //  Caveat: jsonbin's plain GET/PUT has no atomic compare-and-swap, so two
   //  devices racing to preempt at the same instant could each briefly think
-  //  they won. With a 15s heartbeat this self-corrects within a cycle or
-  //  two — acceptable for a couple of personal laptops, not a real consensus
-  //  protocol.
+  //  they won. This self-corrects within a heartbeat cycle or two (see
+  //  CONFIG.deviceHeartbeatMs) — acceptable for a couple of personal
+  //  laptops, not a real consensus protocol.
   // ════════════════════════════════════════════════════════════
 
   function getDeviceId() {
@@ -702,53 +737,12 @@
     alert(`This device's priority is now ${priority}.`);
   });
 
-  GM_registerMenuCommand('🌐 Set Cross-Device Lock (jsonbin.io)', async () => {
-    const binId = prompt(
-      'jsonbin.io Bin ID — create a free account at jsonbin.io, create a bin containing {}, and paste its ID here:',
-      GM_getValue(LS.jsonbinId, '')
-    );
-    if (binId == null) return;
-    const apiKey = prompt(
-      'jsonbin.io X-Master-Key — from your jsonbin.io account\'s API Keys page:',
-      GM_getValue(LS.jsonbinKey, '')
-    );
-    if (apiKey == null) return;
-    GM_setValue(LS.jsonbinId, binId.trim());
-    GM_setValue(LS.jsonbinKey, apiKey.trim());
-
-    if (!binId.trim() || !apiKey.trim()) {
-      alert('Cross-device lock cleared — this device will always run when Start is clicked, with no other-laptop awareness.');
-      return;
-    }
-
-    sharedRecordCache = null; // force a fresh read under the newly-set bin
-    // API keys / watch list sync as "last full write wins" — the first push
-    // under a fresh bin becomes what every other device adopts. Ask which
-    // way this device should go, instead of silently picking a winner.
-    const pushNow = confirm(
-      "Push this device's current API keys and watch list as the shared baseline?\n\n"
-      + 'Choose OK on the FIRST device you set this up on, so its list becomes what every other device syncs to.\n'
-      + "Choose Cancel on additional devices, so you don't overwrite what the first device just pushed."
-    );
-    if (pushNow) {
-      GM_setValue(LS.apiKeysUpdatedAt, Date.now());
-      GM_setValue(LS.watchListUpdatedAt, Date.now());
-      await pushConfigToShared();
-      alert("Cross-device lock configured, and this device's config pushed as the shared baseline.");
-    } else {
-      alert('Cross-device lock configured. This device will adopt the shared config on its next check.');
-    }
-  });
-
   function jsonbinGet() {
     return new Promise((resolve) => {
-      const binId = GM_getValue(LS.jsonbinId, '');
-      const apiKey = GM_getValue(LS.jsonbinKey, '');
-      if (!binId || !apiKey) { resolve(null); return; }
       GM_xmlhttpRequest({
         method: 'GET',
-        url: `${JSONBIN_BASE}/${binId}/latest`,
-        headers: { 'X-Master-Key': apiKey },
+        url: `${JSONBIN_BASE}/${EMBEDDED_JSONBIN_ID}/latest`,
+        headers: { 'X-Master-Key': EMBEDDED_JSONBIN_KEY },
         onload: (r) => {
           if (r.status < 200 || r.status >= 300) {
             console.warn(`[TLW] Cross-device lock read failed: HTTP ${r.status}`);
@@ -769,13 +763,10 @@
 
   function jsonbinPut(record) {
     return new Promise((resolve) => {
-      const binId = GM_getValue(LS.jsonbinId, '');
-      const apiKey = GM_getValue(LS.jsonbinKey, '');
-      if (!binId || !apiKey) { resolve(false); return; }
       GM_xmlhttpRequest({
         method: 'PUT',
-        url: `${JSONBIN_BASE}/${binId}`,
-        headers: { 'X-Master-Key': apiKey, 'Content-Type': 'application/json' },
+        url: `${JSONBIN_BASE}/${EMBEDDED_JSONBIN_ID}`,
+        headers: { 'X-Master-Key': EMBEDDED_JSONBIN_KEY, 'Content-Type': 'application/json' },
         data: JSON.stringify(record),
         onload: (r) => resolve(r.status >= 200 && r.status < 300),
         onerror: () => { console.warn('[TLW] Cross-device lock write failed (network error).'); resolve(false); },
@@ -799,11 +790,6 @@
   async function refreshDeviceLockIfDue() {
     if (Date.now() - lastDeviceLockCheckAt < CONFIG.deviceHeartbeatMs) return;
     lastDeviceLockCheckAt = Date.now();
-
-    if (!GM_getValue(LS.jsonbinId, '') || !GM_getValue(LS.jsonbinKey, '')) {
-      isDeviceActive = true; // no cross-device lock configured — behave as a single device
-      return;
-    }
 
     const remote = await jsonbinGet();
     sharedRecordCache = remote;
@@ -861,14 +847,11 @@
   // ════════════════════════════════════════════════════════════
 
   async function pushConfigToShared() {
-    if (!GM_getValue(LS.jsonbinId, '') || !GM_getValue(LS.jsonbinKey, '')) return;
     const record = sharedRecordCache || (await jsonbinGet()) || {};
     record.apiKeys = getApiKeys();
     record.apiKeysUpdatedAt = GM_getValue(LS.apiKeysUpdatedAt, 0);
     record.watchList = getWatchList();
     record.watchListUpdatedAt = GM_getValue(LS.watchListUpdatedAt, 0);
-    record.discordWebhook = getDiscordWebhook();
-    record.discordWebhookUpdatedAt = GM_getValue(LS.discordWebhookUpdatedAt, 0);
     const ok = await jsonbinPut(record);
     if (ok) sharedRecordCache = record;
   }
@@ -889,13 +872,6 @@
       GM_setValue(LS.watchListUpdatedAt, remote.watchListUpdatedAt);
       console.log(`[TLW] Synced watch list (${remote.watchList.length} player(s)) from another device.`);
       renderPanel(); // reflect the newly-synced list immediately, not just on the next poll
-    }
-
-    const localWebhookAt = GM_getValue(LS.discordWebhookUpdatedAt, 0);
-    if (typeof remote.discordWebhook === 'string' && remote.discordWebhookUpdatedAt > localWebhookAt) {
-      GM_setValue(LS.discordWebhook, remote.discordWebhook);
-      GM_setValue(LS.discordWebhookUpdatedAt, remote.discordWebhookUpdatedAt);
-      console.log('[TLW] Synced Discord webhook from another device.');
     }
   }
 
