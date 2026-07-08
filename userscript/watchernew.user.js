@@ -28,8 +28,15 @@
     checkGapMs: 3_000,       // gap between checking one profile and the next (not per full cycle)
     perRequestDelayMs: 800,  // gap between calls REUSING THE SAME key (Torn's soft limit is ~100/min/key)
     maxApiKeys: 10,
-    deviceHeartbeatMs: 15_000, // how often the active device refreshes the shared cross-device lock
-    deviceLockTtlMs: 45_000,   // if the active device hasn't refreshed this long, another laptop takes over
+    // jsonbin.io's free tier caps out at 10,000 requests total. If an
+    // always-on server (see torn-watcher-server/) is also sharing this bin
+    // 24/7, a 15s heartbeat would blow the monthly quota in under 2 days.
+    // These MUST match torn-watcher-server/server.js's JSONBIN_SYNC_INTERVAL_MS
+    // / DEVICE_LOCK_TTL_MS — otherwise this laptop would see the server's
+    // (intentionally infrequent) heartbeat as "stale" long before it
+    // actually is, and wrongly try to take over.
+    deviceHeartbeatMs: 10 * 60_000, // how often the active device refreshes the shared cross-device lock
+    deviceLockTtlMs: 30 * 60_000,   // if the active device hasn't refreshed this long, another device takes over
   };
 
   const API_BASE = 'https://api.torn.com/v2';
@@ -37,7 +44,9 @@
 
   const LS = {
     apiKeys: 'tlw_api_keys', // array of up to CONFIG.maxApiKeys key strings, all on your own account
+    apiKeysUpdatedAt: 'tlw_api_keys_updated_at',
     watchList: 'tlw_watch_list',   // array of numeric player IDs
+    watchListUpdatedAt: 'tlw_watch_list_updated_at',
     lastStatus: 'tlw_last_status', // { [id]: { state, description } }
     running: 'tlw_running',
     lock: 'tlw_lock',
@@ -45,10 +54,13 @@
     discordMessageId: 'tlw_discord_message_id',
     deviceId: 'tlw_device_id',
     deviceName: 'tlw_device_name',
+    devicePriority: 'tlw_device_priority', // lower number = higher priority; default (unset) = 100
     jsonbinId: 'tlw_jsonbin_id',
     jsonbinKey: 'tlw_jsonbin_key',
     showDisabled: 'tlw_show_disabled', // panel-only: whether unchecked players are shown at all
   };
+
+  const DEFAULT_DEVICE_PRIORITY = 100;
 
   const TAB_ID = Math.random().toString(36).slice(2, 10);
   const LOCK_TTL_MS = CONFIG.checkGapMs * 4;
@@ -65,6 +77,16 @@
     return GM_getValue(LS.apiKeys, []);
   }
 
+  // Central setter (instead of calling GM_setValue directly) so every write
+  // stamps a timestamp and pushes to the shared jsonbin record, letting
+  // other devices pick up the change automatically. See pushConfigToShared()
+  // / pullConfigFromRemote() further down.
+  function setApiKeys(keys) {
+    GM_setValue(LS.apiKeys, keys);
+    GM_setValue(LS.apiKeysUpdatedAt, Date.now());
+    pushConfigToShared();
+  }
+
   GM_registerMenuCommand(`🔑 Set Torn API Keys (up to ${CONFIG.maxApiKeys})`, () => {
     const current = getApiKeys().join(', ');
     const input = prompt(
@@ -73,13 +95,14 @@
     );
     if (input == null) return;
     const keys = input.split(',').map((s) => s.trim()).filter(Boolean).slice(0, CONFIG.maxApiKeys);
-    GM_setValue(LS.apiKeys, keys);
+    setApiKeys(keys);
     alert(keys.length ? `Saved ${keys.length} API key(s).` : 'API keys cleared.');
   });
 
   // Quicker than editing the full comma-separated list above — just types
-  // one new key into a fresh, empty prompt.
-  GM_registerMenuCommand('➕ Add One Torn API Key', () => {
+  // one new key into a fresh, empty prompt. Lives as a button in the on-page
+  // panel rather than the Tampermonkey menu (see the panel's action row).
+  function addOneApiKey() {
     const key = prompt('Enter one Torn API key to add:', '');
     if (key == null || !key.trim()) return;
     const keys = getApiKeys();
@@ -88,9 +111,9 @@
       return;
     }
     keys.push(key.trim());
-    GM_setValue(LS.apiKeys, keys);
+    setApiKeys(keys);
     alert(`Added. Now have ${keys.length} key(s).`);
-  });
+  }
 
   // ════════════════════════════════════════════════════════════
   //  DISCORD RELAY — optional. Instead of posting a new message per event,
@@ -155,9 +178,10 @@
   //
   // It deliberately does NOT fetch jsonbin on every call — sharedRecordCache
   // (populated by the lock heartbeat in refreshDeviceLockIfDue, which already
-  // reads the same record every ~15s) is reused instead, since a message id
-  // essentially never changes and jsonbin's free tier has a tight request
-  // quota. A stale-by-up-to-15s read of the id is harmless.
+  // reads the same record every CONFIG.deviceHeartbeatMs) is reused instead,
+  // since a message id essentially never changes and jsonbin's free tier has
+  // a tight request quota. A stale-by-up-to-one-heartbeat read of the id is
+  // harmless.
   async function getSharedDiscordMessageId() {
     if (!GM_getValue(LS.jsonbinId, '') || !GM_getValue(LS.jsonbinKey, '')) {
       return GM_getValue(LS.discordMessageId, null);
@@ -293,6 +317,14 @@
     return GM_getValue(LS.watchList, []);
   }
 
+  // Central setter — same reasoning as setApiKeys() above: stamps a
+  // timestamp and pushes to the shared record so other devices sync it.
+  function setWatchList(list) {
+    GM_setValue(LS.watchList, list);
+    GM_setValue(LS.watchListUpdatedAt, Date.now());
+    pushConfigToShared();
+  }
+
   function getEnabledIds() {
     return getWatchList().filter((e) => e.enabled).map((e) => e.id);
   }
@@ -316,7 +348,7 @@
     // default to enabled.
     const existingEnabled = new Map(getWatchList().map((e) => [e.id, e.enabled]));
     const newList = ids.map((id) => ({ id, enabled: existingEnabled.has(id) ? existingEnabled.get(id) : true }));
-    GM_setValue(LS.watchList, newList);
+    setWatchList(newList);
 
     // Clear stale baselines for anyone no longer watched, so a re-added ID
     // starts fresh instead of comparing against very old state.
@@ -329,8 +361,9 @@
   });
 
   // Quicker than editing the full comma-separated list above — just types
-  // one new ID into a fresh, empty prompt, enabled by default.
-  GM_registerMenuCommand('➕ Add One Watched Player ID', () => {
+  // one new ID into a fresh, empty prompt, enabled by default. Lives as a
+  // button in the on-page panel rather than the Tampermonkey menu.
+  function addOneWatchedId() {
     const input = prompt('Enter one player ID to add:', '');
     if (input == null || !input.trim()) return;
     const id = parseInt(input.trim(), 10);
@@ -344,22 +377,22 @@
       return;
     }
     list.push({ id, enabled: true });
-    GM_setValue(LS.watchList, list);
+    setWatchList(list);
     alert(`Added #${id}. Now watching ${list.length} player(s).`);
-  });
+  }
 
   function toggleWatched(id, enabled) {
     const list = getWatchList();
     const entry = list.find((e) => e.id === id);
     if (!entry) return;
     entry.enabled = enabled;
-    GM_setValue(LS.watchList, list);
+    setWatchList(list);
     console.log(`[TLW] ${enabled ? 'Enabled' : 'Disabled'} monitoring for #${id}`);
   }
 
   function removeWatched(id) {
     const list = getWatchList().filter((e) => e.id !== id);
-    GM_setValue(LS.watchList, list);
+    setWatchList(list);
     const lastStatus = GM_getValue(LS.lastStatus, {});
     delete lastStatus[id];
     GM_setValue(LS.lastStatus, lastStatus);
@@ -477,7 +510,7 @@
     const entry = list.find((e) => e.id === curr.id);
     if (entry && entry.enabled) {
       entry.enabled = false;
-      GM_setValue(LS.watchList, list);
+      setWatchList(list);
       console.log(`[TLW] Auto-unchecked ${curr.name} (#${curr.id}) — offline for over 1 hour.`);
     }
   }
@@ -556,10 +589,11 @@
   // re-evaluates them — checkInactivity() inside checkOnePlayer() then
   // unchecks anyone still offline for over an hour based on the fresh data.
   // Runs regardless of Start/Stop or which device is active, since it's a
-  // one-off manual action, not the background polling loop.
-  GM_registerMenuCommand('🔄 Check All Players Now', async () => {
+  // one-off manual action, not the background polling loop. Lives as a
+  // button in the on-page panel rather than the Tampermonkey menu.
+  async function checkAllPlayersNow() {
     if (getApiKeys().length === 0) {
-      alert('Set at least one Torn API key first (Tampermonkey menu → "Set Torn API Keys").');
+      alert('Set at least one Torn API key first.');
       return;
     }
     const list = getWatchList();
@@ -569,7 +603,7 @@
     }
 
     list.forEach((e) => { e.enabled = true; });
-    GM_setValue(LS.watchList, list);
+    setWatchList(list);
 
     console.log(`[TLW] Manually checking all ${list.length} player(s)...`);
     for (const entry of list) {
@@ -580,7 +614,7 @@
       }
     }
     console.log('[TLW] Manual check-all complete.');
-  });
+  }
 
   // ════════════════════════════════════════════════════════════
   //  LEADER LOCK — avoid duplicate polling/API calls across multiple open tabs
@@ -603,9 +637,18 @@
   //  jsonbin.io (a small free JSON storage API) instead of local
   //  GM_setValue, since GM storage doesn't sync between separate laptops.
   //  Whichever device currently holds a fresh lock is the only one that
-  //  actually polls; others idle and take over once the holder's heartbeat
-  //  goes stale (it closed its browser, lost network, etc). No fixed
-  //  priority — whoever claims it first keeps it until it goes stale.
+  //  actually polls; others idle and take over either when the holder's
+  //  heartbeat goes stale (it closed its browser, lost network, etc), OR
+  //  immediately if a device with a better (lower-numbered) priority comes
+  //  online — see getDevicePriority(). Devices left at the default priority
+  //  never preempt each other, so with no priorities set this degrades to
+  //  plain "whoever claims it first keeps it."
+  //
+  //  Caveat: jsonbin's plain GET/PUT has no atomic compare-and-swap, so two
+  //  devices racing to preempt at the same instant could each briefly think
+  //  they won. With a 15s heartbeat this self-corrects within a cycle or
+  //  two — acceptable for a couple of personal laptops, not a real consensus
+  //  protocol.
   // ════════════════════════════════════════════════════════════
 
   function getDeviceId() {
@@ -627,7 +670,26 @@
     GM_setValue(LS.deviceName, name.trim() || getDeviceId());
   });
 
-  GM_registerMenuCommand('🌐 Set Cross-Device Lock (jsonbin.io)', () => {
+  function getDevicePriority() {
+    return GM_getValue(LS.devicePriority, DEFAULT_DEVICE_PRIORITY);
+  }
+
+  GM_registerMenuCommand('🏆 Set Device Priority', () => {
+    const input = prompt(
+      `Lower number = higher priority. A device with a better priority than whoever currently holds the lock takes over immediately, without waiting for their heartbeat to go stale. Leave all devices at the default (${DEFAULT_DEVICE_PRIORITY}) for the old "whoever's active keeps it" behavior.`,
+      String(getDevicePriority())
+    );
+    if (input == null) return;
+    const priority = parseInt(input.trim(), 10);
+    if (!Number.isFinite(priority)) {
+      alert('That\'s not a valid number.');
+      return;
+    }
+    GM_setValue(LS.devicePriority, priority);
+    alert(`This device's priority is now ${priority}.`);
+  });
+
+  GM_registerMenuCommand('🌐 Set Cross-Device Lock (jsonbin.io)', async () => {
     const binId = prompt(
       'jsonbin.io Bin ID — create a free account at jsonbin.io, create a bin containing {}, and paste its ID here:',
       GM_getValue(LS.jsonbinId, '')
@@ -640,9 +702,29 @@
     if (apiKey == null) return;
     GM_setValue(LS.jsonbinId, binId.trim());
     GM_setValue(LS.jsonbinKey, apiKey.trim());
-    alert(binId.trim() && apiKey.trim()
-      ? 'Cross-device lock configured. Set the SAME Bin ID and key on every laptop running this script.'
-      : 'Cross-device lock cleared — this device will always run when Start is clicked, with no other-laptop awareness.');
+
+    if (!binId.trim() || !apiKey.trim()) {
+      alert('Cross-device lock cleared — this device will always run when Start is clicked, with no other-laptop awareness.');
+      return;
+    }
+
+    sharedRecordCache = null; // force a fresh read under the newly-set bin
+    // API keys / watch list sync as "last full write wins" — the first push
+    // under a fresh bin becomes what every other device adopts. Ask which
+    // way this device should go, instead of silently picking a winner.
+    const pushNow = confirm(
+      "Push this device's current API keys and watch list as the shared baseline?\n\n"
+      + 'Choose OK on the FIRST device you set this up on, so its list becomes what every other device syncs to.\n'
+      + "Choose Cancel on additional devices, so you don't overwrite what the first device just pushed."
+    );
+    if (pushNow) {
+      GM_setValue(LS.apiKeysUpdatedAt, Date.now());
+      GM_setValue(LS.watchListUpdatedAt, Date.now());
+      await pushConfigToShared();
+      alert("Cross-device lock configured, and this device's config pushed as the shared baseline.");
+    } else {
+      alert('Cross-device lock configured. This device will adopt the shared config on its next check.');
+    }
   });
 
   function jsonbinGet() {
@@ -712,21 +794,31 @@
 
     const remote = await jsonbinGet();
     sharedRecordCache = remote;
+    pullConfigFromRemote(remote); // adopt newer API keys / watch list from another device, if any
     const now = Date.now();
     const deviceId = getDeviceId();
+    const myPriority = getDevicePriority();
+    const remotePriority = remote && remote.priority != null ? remote.priority : DEFAULT_DEVICE_PRIORITY;
     const isFree = !remote || !remote.owner;
     const isOurs = remote && remote.owner === deviceId;
     const isStale = remote && now - remote.ts > CONFIG.deviceLockTtlMs;
+    // Lower number wins. With everyone left at the default priority this is
+    // always false (equal, not strictly less), preserving the original
+    // "whoever's active keeps it" behavior unless priorities are actually set.
+    const hasBetterPriority = !isOurs && myPriority < remotePriority;
 
     const wasActive = isDeviceActive;
-    if (isFree || isOurs || isStale) {
+    if (isFree || isOurs || isStale || hasBetterPriority) {
       // Spread the existing record first so this heartbeat write doesn't
       // clobber discordMessageId (set independently, only when it changes).
-      const updated = { ...(remote || {}), owner: deviceId, name: getDeviceName(), ts: now };
+      const updated = { ...(remote || {}), owner: deviceId, name: getDeviceName(), priority: myPriority, ts: now };
       const ok = await jsonbinPut(updated);
       if (ok) {
         sharedRecordCache = updated;
-        if (!isOurs) console.log(`[TLW] This device (${getDeviceName()}) is now the active instance.`);
+        if (!isOurs) {
+          const reason = hasBetterPriority && !isFree && !isStale ? ' (higher priority)' : '';
+          console.log(`[TLW] This device (${getDeviceName()}) is now the active instance${reason}.`);
+        }
       }
       isDeviceActive = ok;
     } else {
@@ -738,6 +830,51 @@
     // Nothing else re-renders the panel on a standby device (it never
     // touches lastStatus), so trigger it directly on any state flip.
     if (wasActive !== isDeviceActive) renderPanel();
+  }
+
+  // ════════════════════════════════════════════════════════════
+  //  CONFIG SYNC — API keys and the watch list piggyback on the same
+  //  shared jsonbin record as the lock. Each is "last full write wins":
+  //  whichever device most recently changed its list pushes the whole list
+  //  + a timestamp; every device (active or standby) adopts it wholesale
+  //  whenever the remote timestamp is newer than what it last saw. This
+  //  handles both additions AND removals correctly (an item you delete
+  //  won't reappear), at the cost of the usual last-write-wins risk: if two
+  //  devices each edit before either has pulled the other's change (i.e.
+  //  within the same CONFIG.deviceHeartbeatMs window), whichever push lands
+  //  second wins outright and the other's edit is silently overwritten.
+  //  Fine for a couple of personal laptops, not a real merge/
+  //  conflict-resolution system.
+  // ════════════════════════════════════════════════════════════
+
+  async function pushConfigToShared() {
+    if (!GM_getValue(LS.jsonbinId, '') || !GM_getValue(LS.jsonbinKey, '')) return;
+    const record = sharedRecordCache || (await jsonbinGet()) || {};
+    record.apiKeys = getApiKeys();
+    record.apiKeysUpdatedAt = GM_getValue(LS.apiKeysUpdatedAt, 0);
+    record.watchList = getWatchList();
+    record.watchListUpdatedAt = GM_getValue(LS.watchListUpdatedAt, 0);
+    const ok = await jsonbinPut(record);
+    if (ok) sharedRecordCache = record;
+  }
+
+  function pullConfigFromRemote(remote) {
+    if (!remote) return;
+
+    const localApiKeysAt = GM_getValue(LS.apiKeysUpdatedAt, 0);
+    if (Array.isArray(remote.apiKeys) && remote.apiKeysUpdatedAt > localApiKeysAt) {
+      GM_setValue(LS.apiKeys, remote.apiKeys);
+      GM_setValue(LS.apiKeysUpdatedAt, remote.apiKeysUpdatedAt);
+      console.log(`[TLW] Synced ${remote.apiKeys.length} API key(s) from another device.`);
+    }
+
+    const localWatchListAt = GM_getValue(LS.watchListUpdatedAt, 0);
+    if (Array.isArray(remote.watchList) && remote.watchListUpdatedAt > localWatchListAt) {
+      GM_setValue(LS.watchList, remote.watchList);
+      GM_setValue(LS.watchListUpdatedAt, remote.watchListUpdatedAt);
+      console.log(`[TLW] Synced watch list (${remote.watchList.length} player(s)) from another device.`);
+      renderPanel(); // reflect the newly-synced list immediately, not just on the next poll
+    }
   }
 
   // ════════════════════════════════════════════════════════════
@@ -769,7 +906,7 @@
       font: 12px/1.5 -apple-system, Arial, sans-serif;
       padding: 8px 10px;
       border-radius: 6px;
-      max-width: 260px;
+      max-width: 280px;
       max-height: 40vh;
       overflow-y: auto;
       box-shadow: 0 2px 8px rgba(0, 0, 0, 0.5);
@@ -806,6 +943,23 @@
     });
     headerRow.appendChild(toggleShow);
     panel.appendChild(headerRow);
+
+    const actionsRow = document.createElement('div');
+    actionsRow.style.cssText = 'display:flex;flex-wrap:wrap;gap:4px;margin-bottom:6px;';
+    const actionButtonStyle = 'cursor:pointer;font-size:10px;padding:2px 6px;border-radius:4px;'
+      + 'border:1px solid #555;background:#333;color:#eee;';
+    const makeActionButton = (label, title, onClick) => {
+      const btn = document.createElement('button');
+      btn.textContent = label;
+      btn.title = title;
+      btn.style.cssText = actionButtonStyle;
+      btn.addEventListener('click', onClick);
+      return btn;
+    };
+    actionsRow.appendChild(makeActionButton('🔄 Check all', 'Check every watched player right now', checkAllPlayersNow));
+    actionsRow.appendChild(makeActionButton('🔑 +Key', 'Add one Torn API key', addOneApiKey));
+    actionsRow.appendChild(makeActionButton('➕ +ID', 'Add one watched player ID', addOneWatchedId));
+    panel.appendChild(actionsRow);
 
     const fullList = getWatchList();
     const list = sortEnabledFirst(fullList).filter((e) => e.enabled || showDisabled);
