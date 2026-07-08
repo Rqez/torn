@@ -52,6 +52,7 @@
     lock: 'tlw_lock',
     discordWebhook: 'tlw_discord_webhook',
     discordMessageId: 'tlw_discord_message_id',
+    discordWebhookUpdatedAt: 'tlw_discord_webhook_updated_at',
     deviceId: 'tlw_device_id',
     deviceName: 'tlw_device_name',
     devicePriority: 'tlw_device_priority', // lower number = higher priority; default (unset) = 100
@@ -126,6 +127,18 @@
     return GM_getValue(LS.discordWebhook, '');
   }
 
+  // Central setter (same reasoning as setApiKeys()/setWatchList()) — pushes
+  // to the shared jsonbin record so other devices, INCLUDING the always-on
+  // server, pick it up. Previously this only ever wrote local GM storage,
+  // which meant the server (which only ever reads sharedRecord.discordWebhook)
+  // never saw a webhook set from a laptop at all — it silently no-op'd on
+  // every Discord call since the webhook always read as empty.
+  function setDiscordWebhook(url) {
+    GM_setValue(LS.discordWebhook, url);
+    GM_setValue(LS.discordWebhookUpdatedAt, Date.now());
+    pushConfigToShared();
+  }
+
   GM_registerMenuCommand('🔔 Set Discord Webhook (for friend)', async () => {
     const current = getDiscordWebhook();
     const url = prompt(
@@ -133,7 +146,7 @@
       current
     );
     if (url == null) return;
-    GM_setValue(LS.discordWebhook, url.trim());
+    setDiscordWebhook(url.trim());
     await setSharedDiscordMessageId(null); // start a fresh message under the new webhook
     alert(url.trim() ? 'Discord webhook saved.' : 'Discord webhook cleared — alerts will only show locally.');
   });
@@ -854,6 +867,8 @@
     record.apiKeysUpdatedAt = GM_getValue(LS.apiKeysUpdatedAt, 0);
     record.watchList = getWatchList();
     record.watchListUpdatedAt = GM_getValue(LS.watchListUpdatedAt, 0);
+    record.discordWebhook = getDiscordWebhook();
+    record.discordWebhookUpdatedAt = GM_getValue(LS.discordWebhookUpdatedAt, 0);
     const ok = await jsonbinPut(record);
     if (ok) sharedRecordCache = record;
   }
@@ -874,6 +889,13 @@
       GM_setValue(LS.watchListUpdatedAt, remote.watchListUpdatedAt);
       console.log(`[TLW] Synced watch list (${remote.watchList.length} player(s)) from another device.`);
       renderPanel(); // reflect the newly-synced list immediately, not just on the next poll
+    }
+
+    const localWebhookAt = GM_getValue(LS.discordWebhookUpdatedAt, 0);
+    if (typeof remote.discordWebhook === 'string' && remote.discordWebhookUpdatedAt > localWebhookAt) {
+      GM_setValue(LS.discordWebhook, remote.discordWebhook);
+      GM_setValue(LS.discordWebhookUpdatedAt, remote.discordWebhookUpdatedAt);
+      console.log('[TLW] Synced Discord webhook from another device.');
     }
   }
 
