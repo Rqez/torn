@@ -1,15 +1,14 @@
 {
-  "name": "torn-war-helper-server",
+  "name": "torn-watcher-server",
   "version": "1.0.0",
-  "private": true,
-  "description": "Tiny sync server for the Torn War Helper userscript's call/claim system",
-  "main": "index.js",
+  "description": "Always-on background poller for the Torn Player Location Watcher. Reads config (API keys, watch list, Discord webhook) from a shared jsonbin.io bin, polls the Torn API, and posts to Discord. Exposes a trivial HTTP endpoint for an external keep-alive pinger (e.g. UptimeRobot) to hit so Render's free tier doesn't spin it down.",
+  "main": "server.js",
   "scripts": {
-    "start": "node index.js"
+    "start": "node server.js"
   },
-  "dependencies": {
-    "cors": "^2.8.5",
-    "dotenv": "^16.4.5",
-    "express": "^4.19.2"
-  }
+  "engines": {
+    "node": ">=18"
+  },
+  "license": "UNLICENSED",
+  "private": true
 }
