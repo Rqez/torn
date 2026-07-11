@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Torn Player Location Watcher
 // @namespace    tc-location-watch
-// @version      2.0
-// @description  Polls the Torn API for a fixed list of player IDs and notifies you when their status changes (Okay/Traveling/Abroad/Hospital/Jail). Single-device only — no external services beyond the Torn API itself.
+// @version      4.1
+// @description  Always-on: polls the Torn API for a fixed list of player IDs and notifies you when their status changes (Okay/Traveling/Abroad/Hospital/Jail). Also tracks Canada's Xanax stock via YATA and Prombot and pings Discord on restock. Runs as part of a hivemind where a self-hosted watcher server (embedded URL, see torn-watcher-server/) arbitrates which single device leads — API keys/watch list only sync via explicit Push/Pull panel buttons.
 // @match        https://weav3r.dev/*
 // @grant        GM_xmlhttpRequest
 // @grant        GM_notification
@@ -13,6 +13,9 @@
 // @connect      api.torn.com
 // @connect      discord.com
 // @connect      discordapp.com
+// @connect      yata.yt
+// @connect      prombot.co.uk
+// @connect      canadaxanax.duckdns.org
 // @run-at       document-idle
 // ==/UserScript==
 
@@ -24,9 +27,19 @@
   // ════════════════════════════════════════════════════════════
 
   const CONFIG = {
-    checkGapMs: 3_000,       // gap between checking one profile and the next (not per full cycle)
-    minApiCallGapMs: 2_000,  // hard floor between ANY two Torn API calls, regardless of key — see apiGet()
+    checkGapMs: 1_000,       // gap between checking one profile and the next (not per full cycle)
+    minApiCallGapMs: 1_000,  // hard floor between ANY two Torn API calls, regardless of key — see apiGet()
     maxApiKeys: 20,
+    // How often this device heartbeats the watcher server (if one is
+    // configured) to refresh/attempt the cross-device lock. This is our own
+    // server now, not a third-party quota-limited store, so it's fine to be
+    // frequent — just needs to stay comfortably under the server's own
+    // DEVICE_LOCK_TTL_MS (20s) so a healthy device's lease never lapses.
+    deviceHeartbeatMs: 7_000,
+    // How often to poll YATA for the Canada Xanax stock check further down.
+    // Unrelated to minApiCallGapMs — YATA is a separate, unauthenticated,
+    // unrated endpoint, not a Torn API call.
+    yataPollMs: 15_000,
   };
 
   const API_BASE = 'https://api.torn.com/v2';
@@ -41,17 +54,51 @@
   // to a public repo.
   const EMBEDDED_DISCORD_WEBHOOK = 'https://discord.com/api/webhooks/1524111939754524672/NsekHui8ycey4215OFyDNCVxPOr5HxlJ7JE18y5ugvaIHmczAD91fV1L0zabVYo0DBa4';
 
+  // Separate webhook, posted to whenever Canada's Xanax hits 0 — its whole
+  // purpose is for a reminder bot sitting in that channel to pick up the
+  // plain-text "command" below. NOTE: a webhook can only ever post plain
+  // message text — it cannot actually invoke a real Discord slash command
+  // (those are interactions only a user/authorized bot can trigger). This
+  // only does anything if the target bot is specifically built to also
+  // parse that exact text pattern from a plain message.
+  const EMBEDDED_REMINDER_WEBHOOK = 'https://discord.com/api/webhooks/1525506946466058350/I8LeeLYkRSnxdVD4ursdciW8P3qJERPP4L5NxFWI-5NfV3cZL5ojibyD6AoEXTD2CilO';
+
+  // Embedded directly — no more "Set Watcher Server URL" menu command.
+  // Served over HTTPS via Caddy (reverse-proxying to the Node server on
+  // localhost:8787, with an auto-renewing Let's Encrypt cert) rather than
+  // hitting the VM's raw IP:port directly. Update this constant (and the
+  // @connect entry above, and re-save the script in Tampermonkey) if the
+  // domain or VM ever changes.
+  const EMBEDDED_SERVER_URL = 'https://canadaxanax.duckdns.org';
+
+  // Default shared secret — must match config.txt's sharedSecret= on the
+  // server for anything to actually be enforced. Editable via the "🔒 Set
+  // Server Shared Secret" menu command below without touching this file.
+  const DEFAULT_SERVER_SECRET = '24a9c856ec1fea1c455ef4f84eb6472fada87c9b46ba9096';
+
   const LS = {
     apiKeys: 'tlw_api_keys', // array of up to CONFIG.maxApiKeys key strings, all on your own account
     watchList: 'tlw_watch_list',   // array of { id, enabled }
     lastStatus: 'tlw_last_status', // { [id]: { name, state, description } }
-    running: 'tlw_running',
     lock: 'tlw_lock',
-    discordMessageId: 'tlw_discord_message_id', // local-only now (single device, nothing to share)
+    // Separate lock, independent of `lock` above — the Xanax poll runs on
+    // its own timer, completely independent of the main player-watching
+    // loop, so it can't rely on that loop's tab lock. Ensures only one tab
+    // (on THIS device) does the Xanax->Discord sync even with multiple
+    // tabs open.
+    xanaxLock: 'tlw_xanax_lock',
+    lastDiscordCreateAt: 'tlw_last_discord_create_at', // safety net — see postNewDiscordMessage()
+    xanaxStock: 'tlw_xanax_stock', // { quantity, cost, updatedAt, zeroAt, source } — last known Canada Xanax stock (source: 'yata' or 'prombot', whichever was freshest)
     showDisabled: 'tlw_show_disabled', // panel-only: whether unchecked players are shown at all
     lastApiCallAt: 'tlw_last_api_call_at', // GM-stored (not in-memory) so the gate holds even across multiple tabs
+    serverSecret: 'tlw_server_secret', // must match the server's config.txt sharedSecret= — editable via menu
+    notifySuppressUntil: 'tlw_notify_suppress_until', // set by checkAllPlayersNow() — see CHECK_ALL_NOTIFY_SUPPRESS_MS
+    deviceId: 'tlw_device_id',
+    deviceName: 'tlw_device_name',
+    devicePriority: 'tlw_device_priority', // lower number = higher priority; default (unset) = 100
   };
 
+  const DEFAULT_DEVICE_PRIORITY = 100;
   const TAB_ID = Math.random().toString(36).slice(2, 10);
   const LOCK_TTL_MS = CONFIG.checkGapMs * 4;
 
@@ -193,15 +240,232 @@
   }
 
   // ════════════════════════════════════════════════════════════
+  //  DEVICE IDENTITY — used by the cross-device lock below to tell devices
+  //  apart and decide who leads.
+  // ════════════════════════════════════════════════════════════
+
+  function getDeviceId() {
+    let id = GM_getValue(LS.deviceId, null);
+    if (!id) {
+      id = 'device-' + Math.random().toString(36).slice(2, 10);
+      GM_setValue(LS.deviceId, id);
+    }
+    return id;
+  }
+
+  function getDeviceName() {
+    return GM_getValue(LS.deviceName, getDeviceId());
+  }
+
+  GM_registerMenuCommand('💻 Name This Device', () => {
+    const name = prompt('Give this device a name (shown in logs/Discord, e.g. "Laptop 1"):', getDeviceName());
+    if (name == null) return;
+    GM_setValue(LS.deviceName, name.trim() || getDeviceId());
+  });
+
+  function getDevicePriority() {
+    return GM_getValue(LS.devicePriority, DEFAULT_DEVICE_PRIORITY);
+  }
+
+  GM_registerMenuCommand('🏆 Set Device Priority', () => {
+    const input = prompt(
+      `Lower number = higher priority. A device with a better priority than whoever currently holds the lead takes over immediately, without waiting for their heartbeat to go stale. Leave all devices at the default (${DEFAULT_DEVICE_PRIORITY}) for plain "whoever's active keeps it" behavior.`,
+      String(getDevicePriority())
+    );
+    if (input == null) return;
+    const priority = parseInt(input.trim(), 10);
+    if (!Number.isFinite(priority)) {
+      alert('That\'s not a valid number.');
+      return;
+    }
+    GM_setValue(LS.devicePriority, priority);
+    alert(`This device's priority is now ${priority}.`);
+  });
+
+  // ════════════════════════════════════════════════════════════
+  //  WATCHER SERVER SYNC — talks to a self-hosted torn-watcher-server
+  //  hivemind instance (see torn-watcher-server/) purely to arbitrate
+  //  leadership: whichever device reports the best priority and keeps
+  //  heartbeating is the one allowed to actually poll Torn/post to Discord;
+  //  everyone else stands by. The server does NOT automatically sync API
+  //  keys/watch list anymore — that only happens when you explicitly click
+  //  the panel's Push/Pull buttons (see pushToServer()/pullFromServer()
+  //  below), so nothing changes on either side unless you ask for it.
+  // ════════════════════════════════════════════════════════════
+
+  function getServerUrl() {
+    return EMBEDDED_SERVER_URL;
+  }
+
+  function getServerSecret() {
+    return GM_getValue(LS.serverSecret, DEFAULT_SERVER_SECRET);
+  }
+
+  GM_registerMenuCommand('🔒 Set Server Shared Secret', () => {
+    const secret = prompt(
+      "Shared secret sent as X-Shared-Secret to the watcher server — must match config.txt's sharedSecret= on the server exactly, or requests get rejected. Leave blank to disable sending one:",
+      getServerSecret()
+    );
+    if (secret == null) return;
+    GM_setValue(LS.serverSecret, secret.trim());
+    alert(secret.trim() ? 'Server shared secret updated.' : 'Server shared secret cleared — requests will be sent with no secret header.');
+  });
+
+  function serverRequest(path, body) {
+    const base = getServerUrl();
+    if (!base) return Promise.resolve(null);
+    const secret = getServerSecret();
+    return new Promise((resolve) => {
+      GM_xmlhttpRequest({
+        method: 'POST',
+        url: `${base}${path}`,
+        headers: {
+          'Content-Type': 'application/json',
+          ...(secret ? { 'X-Shared-Secret': secret } : {}),
+        },
+        data: JSON.stringify(body),
+        onload: (r) => {
+          if (r.status < 200 || r.status >= 300) {
+            console.warn(`[TLW] Watcher server ${path} failed: HTTP ${r.status} — ${r.responseText.slice(0, 200)}`);
+            resolve(null);
+            return;
+          }
+          try {
+            resolve(JSON.parse(r.responseText));
+          } catch {
+            resolve(null);
+          }
+        },
+        onerror: () => { console.warn(`[TLW] Watcher server ${path} request failed (network error).`); resolve(null); },
+      });
+    });
+  }
+
+  // True unless another device currently holds the lead — gates whether
+  // this device's loop actually polls.
+  //
+  // Starts false and stays false until the FIRST successful heartbeat
+  // confirms otherwise — deliberately NOT defaulting to true, because if
+  // this device can never actually reach the server (wrong URL, firewall,
+  // Tampermonkey never approved the connection, etc.), heartbeatTick()
+  // never gets a chance to correct it, and it would otherwise sit there
+  // believing it's the leader forever — running head-to-head with whatever
+  // the server or another device is doing, with neither one ever standing
+  // down.
+  let isDeviceActive = false;
+  let hasEverHeartbeatSucceeded = false;
+
+  // Runs on its OWN independent timer (see setInterval below) rather than
+  // being awaited inline in the main player-checking loop — a heartbeat is
+  // a real network round trip to the watcher server, and awaiting it there
+  // meant that whenever it happened to be slow (a cold TLS handshake, a
+  // brief network hiccup), the ENTIRE player-checking loop stalled right
+  // along with it, producing exactly the periodic multi-second gaps
+  // between Torn API calls that this was supposed to prevent. Now a slow
+  // or failed heartbeat only delays this function's own next tick, and
+  // never touches the per-player check cadence at all.
+  async function heartbeatTick() {
+    const wasActive = isDeviceActive;
+    const res = await serverRequest('/api/heartbeat', {
+      deviceId: getDeviceId(),
+      name: getDeviceName(),
+      priority: getDevicePriority(),
+    });
+    if (!res) {
+      if (!hasEverHeartbeatSucceeded) {
+        // Never once reached the server — almost certainly a wrong URL,
+        // firewall, or an unapproved cross-origin request, not a transient
+        // blip. Standing by (isDeviceActive was never set true to begin
+        // with) rather than guessing active, so this device can't end up
+        // fighting the server or another device for the lead.
+        console.warn('[TLW] Heartbeat has never succeeded — check the watcher server URL/connectivity (Tampermonkey may be prompting for a connection permission). Standing by until it can be confirmed.');
+      } else {
+        // Server unreachable — keep doing whatever we were already doing
+        // rather than guessing; the next heartbeat will sort it out.
+        console.warn('[TLW] Heartbeat failed — watcher server unreachable.');
+      }
+      return;
+    }
+    hasEverHeartbeatSucceeded = true;
+    isDeviceActive = res.active;
+
+    if (isDeviceActive && !wasActive) {
+      console.log('[TLW] This device is now the active instance.');
+    } else if (!isDeviceActive && wasActive) {
+      console.log(`[TLW] Another device (${res.owner ? res.owner.name : 'unknown'}) is active — standing by.`);
+    }
+    if (wasActive !== isDeviceActive) renderPanel();
+  }
+
+  async function heartbeatLoop() {
+    while (true) {
+      try {
+        await heartbeatTick();
+      } catch (e) {
+        console.error('[TLW] Heartbeat tick failed:', e.message);
+      }
+      await sleep(CONFIG.deviceHeartbeatMs);
+    }
+  }
+
+  heartbeatLoop();
+
+  // Explicit, button-triggered overwrite of the server's copy — the server
+  // also enforces leader-only server-side (see handlePush() in server.js),
+  // this check just gives immediate feedback instead of waiting on a 403.
+  async function pushToServer() {
+    if (!isDeviceActive) {
+      alert('Only the currently active/leading device can push. This device is standing by.');
+      return;
+    }
+    const apiKeys = getApiKeys();
+    const watchList = getWatchList();
+    const res = await serverRequest('/api/push', { deviceId: getDeviceId(), apiKeys, watchList });
+    if (res && res.ok) {
+      alert(`Pushed ${apiKeys.length} key(s) and ${watchList.length} player(s) to the server, overwriting what was there.`);
+    } else {
+      alert('Push failed — see the browser console for details.');
+    }
+  }
+
+  // Explicit, button-triggered overwrite of THIS device's local list — no
+  // leadership requirement, any device can pull the server's current copy.
+  async function pullFromServer() {
+    const res = await serverRequest('/api/pull', { deviceId: getDeviceId() });
+    if (!res) {
+      alert('Pull failed — see the browser console for details.');
+      return;
+    }
+    const apiKeys = Array.isArray(res.apiKeys) ? res.apiKeys : [];
+    const watchList = Array.isArray(res.watchList) ? res.watchList : [];
+    GM_setValue(LS.apiKeys, apiKeys);
+    GM_setValue(LS.watchList, watchList);
+    renderPanel();
+    alert(`Pulled ${apiKeys.length} key(s) and ${watchList.length} player(s) from the server, overwriting this device's list.`);
+  }
+
+  // ════════════════════════════════════════════════════════════
   //  DISCORD RELAY — keeps ONE message alive and edits it in place instead
   //  of posting a new one per update, so a friend watching that channel sees
   //  an always-current dashboard rather than a growing feed of alerts. The
-  //  message id is stored locally (GM_setValue) — fine now that this only
-  //  ever runs on one device, so there's nothing to keep in sync.
+  //  message id lives on the watcher server (if configured) so leadership
+  //  can switch devices without ending up with two separate dashboard
+  //  messages — falls back to local storage in single-device mode.
   // ════════════════════════════════════════════════════════════
 
   function getDiscordWebhook() {
     return EMBEDDED_DISCORD_WEBHOOK;
+  }
+
+  function buildXanaxStockLine() {
+    const xanax = GM_getValue(LS.xanaxStock, null);
+    if (!xanax) return '🇨🇦 Xanax: checking...';
+    const costPart = xanax.quantity > 0 ? ` @ $${xanax.cost.toLocaleString()}` : '';
+    const sourceTag = xanax.source ? ` (${xanax.source})` : '';
+    let line = `🇨🇦 Xanax: **${xanax.quantity.toLocaleString()}**${costPart}${sourceTag}`;
+    const flyTimer = xanaxFlyTimer(xanax);
+    if (flyTimer) line += `\nHit 0 at ${flyTimer.zeroTimeStr} — Fly at ${flyTimer.flyTimeStr}`;
+    return line;
   }
 
   // Unlike the on-page panel (which shows disabled players dimmed, since it
@@ -210,7 +474,9 @@
   // monitored right now.
   function buildDiscordContent() {
     const list = getWatchList().filter((e) => e.enabled);
-    if (list.length === 0) return '📍 **Location Watch** — no players currently checked.';
+    const footer = `_from: ${getDeviceName()}_`;
+    const xanaxLine = buildXanaxStockLine();
+    if (list.length === 0) return `📍 **Location Watch** — no players currently checked.\n${xanaxLine}\n${footer}`;
     const lastStatus = GM_getValue(LS.lastStatus, {});
     const lines = list.map((entry) => {
       const s = lastStatus[entry.id];
@@ -225,28 +491,50 @@
       const line = s ? formatStatusLine(s.state, s.description) : 'checking...';
       return `**${namePart}**: ${line}`;
     });
-    return `📍 **Location Watch**\n${lines.join('\n')}`;
+    return `📍 **Location Watch**\n${lines.join('\n')}\n\n${xanaxLine}\n${footer}`;
   }
 
-  function getDiscordMessageId() {
-    return GM_getValue(LS.discordMessageId, null);
+  // Reads/writes the watcher server's shared discordMessageId, so
+  // leadership can hand off between devices without ending up with two
+  // separate dashboard messages. Deliberately no caching — always asks the
+  // server fresh — since a stale local cache getting out of sync with the
+  // server's actual value is exactly what caused a new dashboard message to
+  // get created on every single check in the past. This server is on the
+  // same LAN/personal box, so an extra request per check is cheap;
+  // correctness matters far more here than saving a round trip.
+  async function getSharedDiscordMessageId() {
+    const res = await serverRequest('/api/discord-message-id', { deviceId: getDeviceId() });
+    return (res && res.discordMessageId) || null;
   }
 
-  function setDiscordMessageId(id) {
-    GM_setValue(LS.discordMessageId, id);
+  async function setSharedDiscordMessageId(id) {
+    const res = await serverRequest('/api/discord-message-id', { deviceId: getDeviceId(), messageId: id });
+    if (!res || !res.ok) {
+      console.warn('[TLW] Failed to update the shared Discord message id on the server.');
+    }
   }
+
+  // Safety net: even if something above keeps thinking no dashboard message
+  // exists, this caps it at one new message per MIN_DISCORD_CREATE_GAP_MS
+  // instead of spamming a fresh one on every check.
+  const MIN_DISCORD_CREATE_GAP_MS = 30_000;
 
   // Sent as an embed (not plain `content`) because Discord only renders
   // masked markdown links ([text](url)) inside embeds — plain message
   // content shows the literal "[text](url)" text instead of a hyperlink.
   function postNewDiscordMessage(webhook, content) {
+    const lastCreateAt = GM_getValue(LS.lastDiscordCreateAt, 0);
+    if (Date.now() - lastCreateAt < MIN_DISCORD_CREATE_GAP_MS) {
+      console.warn('[TLW] Skipping new Discord dashboard message — one was already created recently; will retry next check.');
+      return Promise.resolve();
+    }
     return new Promise((resolve) => {
       GM_xmlhttpRequest({
         method: 'POST',
         url: `${webhook}?wait=true`,
         headers: { 'Content-Type': 'application/json' },
         data: JSON.stringify({ embeds: [{ description: content }] }),
-        onload: (r) => {
+        onload: async (r) => {
           if (r.status < 200 || r.status >= 300) {
             console.warn(`[TLW] Discord post failed: HTTP ${r.status} — ${r.responseText.slice(0, 200)}`);
             resolve();
@@ -254,7 +542,10 @@
           }
           try {
             const msg = JSON.parse(r.responseText);
-            if (msg.id) setDiscordMessageId(msg.id);
+            if (msg.id) {
+              GM_setValue(LS.lastDiscordCreateAt, Date.now());
+              await setSharedDiscordMessageId(msg.id);
+            }
           } catch {
             console.warn('[TLW] Discord post succeeded but response could not be parsed for message id.');
           }
@@ -265,11 +556,32 @@
     });
   }
 
+  // The main player-watching loop AND the independent Xanax poll (see
+  // pollCanadaXanaxStock() further down) both call this — they run on
+  // completely separate timers with no coordination between them, so
+  // without this guard they can genuinely overlap (most likely right at
+  // startup, before any dashboard message exists yet): both see "no
+  // messageId" at the same moment and both create their own message. This
+  // just serializes calls WITHIN this one tab; skipping (rather than
+  // queuing) is fine since whichever call loses just gets picked up by
+  // its own next cycle a moment later.
+  let discordSyncInFlight = false;
+
   async function syncDiscordMessage() {
+    if (discordSyncInFlight) return;
+    discordSyncInFlight = true;
+    try {
+      await syncDiscordMessageInner();
+    } finally {
+      discordSyncInFlight = false;
+    }
+  }
+
+  async function syncDiscordMessageInner() {
     const webhook = getDiscordWebhook();
     if (!webhook) return;
     const content = buildDiscordContent();
-    const messageId = getDiscordMessageId();
+    const messageId = await getSharedDiscordMessageId();
 
     if (!messageId) {
       await postNewDiscordMessage(webhook, content);
@@ -285,7 +597,7 @@
         onload: async (r) => {
           if (r.status === 404) {
             // The message was deleted on Discord's side — start a new one.
-            setDiscordMessageId(null);
+            await setSharedDiscordMessageId(null);
             await postNewDiscordMessage(webhook, content);
           } else if (r.status < 200 || r.status >= 300) {
             console.warn(`[TLW] Discord edit failed: HTTP ${r.status} — ${r.responseText.slice(0, 200)}`);
@@ -341,6 +653,187 @@
       },
       onerror: () => console.warn('[TLW] Discord alert post request failed (network error).'),
     });
+  }
+
+  // ════════════════════════════════════════════════════════════
+  //  FOREIGN STOCK — Canada's Xanax stock only, cross-checked from two
+  //  independent public sources (YATA and Prombot — neither needs a Torn API
+  //  key). Whichever reports the more recent "last updated" time is treated
+  //  as current. Shown in the on-page panel and the Discord dashboard
+  //  (tagged with which source it came from), and pings the Discord webhook
+  //  when stock jumps from 0 to something else (a restock). Polls on its own
+  //  timer, independent of the Start/Stop player-watching loop below.
+  // ════════════════════════════════════════════════════════════
+
+  const YATA_EXPORT_URL = 'https://yata.yt/api/v1/travel/export/';
+  const PROMBOT_TRAVEL_URL = 'https://prombot.co.uk:8443/api/travel';
+  // How long after Canada's Xanax hits 0 the "Fly at" timer points to — 1h23m.
+  const XANAX_FLY_DELAY_MS = ((1 * 60) + 23) * 60 * 1000;
+  // Once stock is confirmed at 0, hold that reading (and zeroAt) for this
+  // long before trusting a new candidate again — see the comment in
+  // pollCanadaXanaxStock() below for why.
+  const XANAX_ZERO_LOCK_MS = 10 * 60 * 1000;
+
+  function gmFetchJson(url) {
+    return new Promise((resolve, reject) => {
+      GM_xmlhttpRequest({
+        method: 'GET',
+        url,
+        onload: (r) => {
+          if (r.status < 200 || r.status >= 300) {
+            reject(new Error(`HTTP ${r.status}`));
+            return;
+          }
+          try {
+            resolve(JSON.parse(r.responseText));
+          } catch {
+            reject(new Error('Non-JSON response'));
+          }
+        },
+        onerror: () => reject(new Error('network_error')),
+      });
+    });
+  }
+
+  // YATA's export and Prombot's travel API happen to share this exact shape:
+  // { stocks: { [countryKey]: { update: unixSeconds, stocks: [{ name, quantity, cost }] } } }
+  function extractCanadaXanax(data) {
+    const canada = data && data.stocks && data.stocks.can;
+    if (!canada || !Array.isArray(canada.stocks)) return null;
+    const xanax = canada.stocks.find((it) => it.name === 'Xanax');
+    if (!xanax) return null;
+    const quantity = xanax.quantity ?? xanax.stock ?? xanax.qty ?? 0;
+    return { quantity, cost: xanax.cost, updatedAt: canada.update };
+  }
+
+  async function fetchYataCanadaXanax() {
+    const info = extractCanadaXanax(await gmFetchJson(YATA_EXPORT_URL));
+    return info ? { ...info, source: 'yata' } : null;
+  }
+
+  async function fetchPrombotCanadaXanax() {
+    const info = extractCanadaXanax(await gmFetchJson(PROMBOT_TRAVEL_URL));
+    return info ? { ...info, source: 'prombot' } : null;
+  }
+
+  // Renders the "Hit 0 at / Fly at" timer pair for a stored xanaxStock
+  // record, or null while there's no known zero-timestamp (or stock is
+  // currently in stock, at which point the timer is no longer relevant).
+  function xanaxFlyTimer(xanax) {
+    if (!xanax || xanax.quantity !== 0 || !xanax.zeroAt) return null;
+    return {
+      zeroTimeStr: new Date(xanax.zeroAt).toLocaleTimeString(),
+      flyTimeStr: new Date(xanax.zeroAt + XANAX_FLY_DELAY_MS).toLocaleTimeString(),
+    };
+  }
+
+  // 24-hour HH:MM, e.g. "18:52" — the reminder bot's time: parameter needs
+  // this specific format, distinct from the 12-hour-with-seconds string
+  // used for the on-page panel/Discord dashboard display elsewhere.
+  function formatTime24(ms) {
+    const d = new Date(ms);
+    return `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`;
+  }
+
+  // Fired once, right when Xanax hits 0 (not on every poll during the
+  // zero-lock window). Posts two plain messages to the separate reminder
+  // webhook: the reminder-bot "command" text, and Discord's own <t:...:F>
+  // timestamp token (which Discord renders as a localized date/time for
+  // anyone viewing it — this one needs Unix seconds specifically, not a
+  // locale string).
+  function fireXanaxFlyReminder(flyTimeMs) {
+    const flyTimeStr = formatTime24(flyTimeMs);
+    const unixSeconds = Math.floor(flyTimeMs / 1000);
+
+    const commandText = `/reminder add reason:Xanax time:${flyTimeStr} ping:@Farming Bozos message_content: FLY BOZOS`;
+    const timestampText = `<t:${unixSeconds}:F>`;
+
+    for (const content of [commandText, timestampText]) {
+      GM_xmlhttpRequest({
+        method: 'POST',
+        url: `${EMBEDDED_REMINDER_WEBHOOK}?wait=true`,
+        headers: { 'Content-Type': 'application/json' },
+        data: JSON.stringify({ content }),
+        onload: (r) => {
+          if (r.status < 200 || r.status >= 300) {
+            console.warn(`[TLW] Reminder webhook post failed: HTTP ${r.status} — ${r.responseText.slice(0, 200)}`);
+          }
+        },
+        onerror: () => console.warn('[TLW] Reminder webhook post failed (network error).'),
+      });
+    }
+  }
+
+  async function pollCanadaXanaxStock() {
+    const [yataResult, prombotResult] = await Promise.allSettled([
+      fetchYataCanadaXanax(),
+      fetchPrombotCanadaXanax(),
+    ]);
+    if (yataResult.status === 'rejected') console.warn('[TLW] YATA Canada Xanax fetch failed:', yataResult.reason.message);
+    if (prombotResult.status === 'rejected') console.warn('[TLW] Prombot Canada Xanax fetch failed:', prombotResult.reason.message);
+
+    const candidates = [yataResult, prombotResult]
+      .filter((r) => r.status === 'fulfilled' && r.value)
+      .map((r) => r.value);
+    if (candidates.length === 0) return;
+
+    const prev = GM_getValue(LS.xanaxStock, null);
+
+    // YATA and Prombot scrape/update independently, so right after a real
+    // restock-to-zero event one of them often keeps reporting its last-known
+    // NONZERO count for a bit before catching up — with a timestamp that can
+    // still look "newer" than the other source's already-correct zero
+    // report. Picking "whichever source updated most recently" in that
+    // window would flip back to nonzero, and then re-detect "hitting zero"
+    // again later than it actually happened — falsifying the zeroAt the
+    // "Fly at" timer is based on. So once zero is confirmed, hold it (and
+    // zeroAt) for XANAX_ZERO_LOCK_MS and ignore whatever the sources say
+    // until that lock expires.
+    if (prev && prev.quantity === 0 && prev.zeroAt && Date.now() - prev.zeroAt < XANAX_ZERO_LOCK_MS) {
+      return;
+    }
+
+    // Prefer whichever source reports the more recently updated stock.
+    const best = candidates.reduce((a, b) => (b.updatedAt > a.updatedAt ? b : a));
+
+    // Stamp the exact moment stock hits 0 so the panel/Discord can show a
+    // "Fly at" timer off of it. Carries the previous zeroAt forward
+    // otherwise, so it isn't lost between polls.
+    let zeroAt = prev ? (prev.zeroAt ?? null) : null;
+    if (prev && prev.quantity > 0 && best.quantity === 0) {
+      zeroAt = Date.now();
+    }
+
+    GM_setValue(LS.xanaxStock, { quantity: best.quantity, cost: best.cost, updatedAt: best.updatedAt, zeroAt, source: best.source });
+    renderPanel();
+
+    // The local GM_setValue/panel update above runs on every device/tab
+    // regardless of leadership (harmless, purely local display) — but the
+    // Discord side must not: this poll runs on its own timer, completely
+    // independent of the Start/Stop loop and its isDeviceActive gating, so
+    // without these checks every device AND every tab on the leading
+    // device would independently detect the same restock and post its own
+    // duplicate alert, all fighting over editing the same dashboard
+    // message.
+    if (!isDeviceActive) return;
+    if (!claimXanaxLock()) return;
+
+    // Nonzero -> 0 only, fired exactly once per zero event (the
+    // XANAX_ZERO_LOCK_MS guard above prevents this branch from being
+    // reached again until the lock expires).
+    if (prev && prev.quantity > 0 && best.quantity === 0) {
+      fireXanaxFlyReminder(zeroAt + XANAX_FLY_DELAY_MS);
+    }
+
+    // 0 -> nonzero only — repeated nonzero counts don't re-fire, and a
+    // stale/repeated 0 doesn't either.
+    if (prev && prev.quantity === 0 && best.quantity > 0) {
+      sendTransientDiscordAlert(`💊 **Xanax restocked in Canada** — ${best.quantity.toLocaleString()} available @ $${best.cost.toLocaleString()} each`);
+    }
+    // Keep the persistent dashboard message current too, not just the
+    // on-page panel — otherwise it'd only pick up the new count on the
+    // next player check.
+    await syncDiscordMessage();
   }
 
   // ════════════════════════════════════════════════════════════
@@ -485,8 +978,25 @@
     return null;
   }
 
+  // "Check all" force-checks every watched player at once (see
+  // checkAllPlayersNow() below), which can surface a whole burst of status
+  // changes/baselines simultaneously — one per player, all firing within a
+  // couple of seconds. Suppressing notifications for a couple of minutes
+  // right after using it avoids spamming Discord (and your desktop) with
+  // that burst, without needing to change how the normal background loop
+  // behaves the rest of the time.
+  const CHECK_ALL_NOTIFY_SUPPRESS_MS = 2 * 60 * 1000;
+
+  function isNotifySuppressed() {
+    return Date.now() < GM_getValue(LS.notifySuppressUntil, 0);
+  }
+
   function notifyChange(prev, curr) {
     console.log(`[TLW] ${curr.name} (${curr.id}): ${prev.state} -> ${curr.state} — ${curr.description}`);
+    if (isNotifySuppressed()) {
+      console.log(`[TLW] Suppressing Discord alert for ${curr.name} — recent "Check all" cooldown active.`);
+      return;
+    }
     sendTransientDiscordAlert(`🔔 **${curr.name}**: ${prev.state} → ${curr.state}${curr.description ? ` (${curr.description})` : ''}`);
   }
 
@@ -494,6 +1004,10 @@
   // added to the watch list) — confirms the script is actually running and
   // reaching the API, rather than silently doing nothing until a change.
   function notifyBaseline(curr) {
+    if (isNotifySuppressed()) {
+      console.log(`[TLW] Suppressing baseline notification for ${curr.name} — recent "Check all" cooldown active.`);
+      return;
+    }
     GM_notification({
       title: `${curr.name}: now watching`,
       text: `Current: ${curr.state}${curr.description ? ` (${curr.description})` : ''}`,
@@ -584,7 +1098,8 @@
     list.forEach((e) => { e.enabled = true; });
     setWatchList(list);
 
-    console.log(`[TLW] Manually checking all ${list.length} player(s)...`);
+    GM_setValue(LS.notifySuppressUntil, Date.now() + CHECK_ALL_NOTIFY_SUPPRESS_MS);
+    console.log(`[TLW] Manually checking all ${list.length} player(s)... (notifications suppressed for ${CHECK_ALL_NOTIFY_SUPPRESS_MS / 60_000} minutes)`);
     for (const entry of list) {
       try {
         await checkOnePlayer(entry.id);
@@ -610,6 +1125,19 @@
 
   function refreshLock() {
     GM_setValue(LS.lock, { owner: TAB_ID, ts: Date.now() });
+  }
+
+  // Same idea as claimLock() above, but for the Xanax poll specifically —
+  // see LS.xanaxLock's comment for why it needs its own separate lock
+  // rather than reusing this one.
+  const XANAX_LOCK_TTL_MS = CONFIG.yataPollMs * 4;
+
+  function claimXanaxLock() {
+    const lock = GM_getValue(LS.xanaxLock, null);
+    const now = Date.now();
+    if (lock && lock.owner !== TAB_ID && now - lock.ts < XANAX_LOCK_TTL_MS) return false;
+    GM_setValue(LS.xanaxLock, { owner: TAB_ID, ts: now });
+    return true;
   }
 
   // ════════════════════════════════════════════════════════════
@@ -652,10 +1180,6 @@
 
   function renderPanel() {
     const panel = ensurePanel();
-    if (!isRunning()) {
-      panel.style.display = 'none';
-      return;
-    }
     panel.style.display = 'block';
     panel.innerHTML = '';
 
@@ -664,7 +1188,7 @@
 
     const title = document.createElement('div');
     title.style.cssText = 'font-weight:bold;';
-    title.textContent = '📍 Location Watch';
+    title.textContent = isDeviceActive ? '📍 Location Watch' : '📍 Location Watch (standing by)';
     headerRow.appendChild(title);
 
     const showDisabled = getShowDisabled();
@@ -678,6 +1202,28 @@
     });
     headerRow.appendChild(toggleShow);
     panel.appendChild(headerRow);
+
+    const xanax = GM_getValue(LS.xanaxStock, null);
+    const stockRow = document.createElement('div');
+    stockRow.style.cssText = 'margin-bottom:6px;padding:3px 6px;background:rgba(255,255,255,0.05);border-radius:4px;';
+    if (xanax) {
+      const stockColor = xanax.quantity > 0 ? '#7CFC9A' : '#ff6b6b';
+      const costPart = xanax.quantity > 0 ? ` @ $${escapeHtml(xanax.cost.toLocaleString())}` : '';
+      const sourceTag = xanax.source ? ` <span style="opacity:0.5;">(${escapeHtml(xanax.source)})</span>` : '';
+      stockRow.innerHTML = `🇨🇦 Xanax: <b style="color:${stockColor}">${escapeHtml(xanax.quantity.toLocaleString())}</b>${costPart}${sourceTag}`
+        + ` <span style="opacity:0.55;font-size:10px;">(${timeAgo(xanax.updatedAt)})</span>`;
+    } else {
+      stockRow.innerHTML = '<span style="opacity:0.7;">🇨🇦 Xanax: checking...</span>';
+    }
+    panel.appendChild(stockRow);
+
+    const flyTimer = xanaxFlyTimer(xanax);
+    if (flyTimer) {
+      const flyRow = document.createElement('div');
+      flyRow.style.cssText = 'margin-bottom:6px;padding:3px 6px;background:rgba(255,255,255,0.05);border-radius:4px;font-size:11px;opacity:0.85;';
+      flyRow.innerHTML = `Hit 0 at <b>${escapeHtml(flyTimer.zeroTimeStr)}</b> — Fly at <b>${escapeHtml(flyTimer.flyTimeStr)}</b>`;
+      panel.appendChild(flyRow);
+    }
 
     const actionsRow = document.createElement('div');
     actionsRow.style.cssText = 'display:flex;flex-wrap:wrap;gap:4px;margin-bottom:6px;';
@@ -694,6 +1240,8 @@
     actionsRow.appendChild(makeActionButton('🔄 Check all', 'Check every watched player right now', checkAllPlayersNow));
     actionsRow.appendChild(makeActionButton('🔑 +Key', 'Add one Torn API key', addOneApiKey));
     actionsRow.appendChild(makeActionButton('➕ +ID', 'Add one watched player ID', addOneWatchedId));
+    actionsRow.appendChild(makeActionButton('⬆️ Push', "Push this device's API keys/watch list to the watcher server, overwriting it (only works while this device is leading)", pushToServer));
+    actionsRow.appendChild(makeActionButton('⬇️ Pull', "Pull the API keys/watch list from the watcher server, overwriting this device's list", pullFromServer));
     panel.appendChild(actionsRow);
 
     const fullList = getWatchList();
@@ -758,19 +1306,20 @@
   // stays live even in tabs that aren't doing the polling.
   GM_addValueChangeListener(LS.lastStatus, renderPanel);
   GM_addValueChangeListener(LS.watchList, renderPanel);
-  GM_addValueChangeListener(LS.running, renderPanel);
+  GM_addValueChangeListener(LS.xanaxStock, renderPanel);
   renderPanel();
 
-  // ════════════════════════════════════════════════════════════
-  //  MAIN LOOP
-  // ════════════════════════════════════════════════════════════
+  pollCanadaXanaxStock();
+  setInterval(pollCanadaXanaxStock, CONFIG.yataPollMs);
 
-  function isRunning() {
-    return GM_getValue(LS.running, false);
-  }
+  // ════════════════════════════════════════════════════════════
+  //  MAIN LOOP — always runs once the page loads. No more Start/Stop menu:
+  //  if there's nothing to check yet (no keys, no watch list), it just
+  //  idles and logs a warning until you add some via the panel/menu.
+  // ════════════════════════════════════════════════════════════
 
   async function loop() {
-    while (isRunning()) {
+    while (true) {
       if (getApiKeys().length === 0) {
         console.warn('[TLW] No API keys set. Use the Tampermonkey menu "Set Torn API Keys".');
         await sleep(CONFIG.checkGapMs);
@@ -781,11 +1330,19 @@
         await sleep(CONFIG.checkGapMs);
         continue;
       }
+      // heartbeatLoop() (see above) maintains isDeviceActive on its own
+      // independent timer — just read the latest value here, never await
+      // the heartbeat request itself on this path.
+      if (!isDeviceActive) {
+        await sleep(CONFIG.checkGapMs);
+        continue;
+      }
       if (!claimLock()) {
         await sleep(CONFIG.checkGapMs);
         continue;
       }
       refreshLock();
+      const tickStart = Date.now();
       const id = nextPlayerId();
       if (id != null) {
         try {
@@ -794,32 +1351,16 @@
           console.error('[TLW] Check failed:', e.message);
         }
       }
-      await sleep(CONFIG.checkGapMs);
+      // Elapsed-time-aware: checkOnePlayer() also does its own network work
+      // (the Torn API call, plus syncing the Discord message id with the
+      // watcher server and PATCHing Discord itself) that can easily take
+      // over a second on its own — sleeping a FULL checkGapMs on top of that
+      // unconditionally is what caused the irregular 1-3s gaps between
+      // calls. Only sleep out whatever's left of the target interval.
+      const wait = CONFIG.checkGapMs - (Date.now() - tickStart);
+      if (wait > 0) await sleep(wait);
     }
-    console.log('[TLW] Stopped.');
   }
 
-  GM_registerMenuCommand('▶ Start Location Watch', () => {
-    if (isRunning()) return;
-    if (getApiKeys().length === 0) {
-      alert('Set at least one Torn API key first (Tampermonkey menu → "Set Torn API Keys").');
-      return;
-    }
-    if (getWatchList().length === 0) {
-      alert('Set at least one player ID first (Tampermonkey menu → "Set Watched Player IDs").');
-      return;
-    }
-    GM_setValue(LS.lock, null);
-    GM_setValue(LS.running, true);
-    console.log('[TLW] Started.');
-    loop();
-  });
-
-  GM_registerMenuCommand('⏹ Stop Location Watch', () => {
-    GM_setValue(LS.running, false);
-  });
-
-  if (isRunning()) {
-    loop();
-  }
+  loop();
 })();
