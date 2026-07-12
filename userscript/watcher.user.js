@@ -174,6 +174,35 @@
     return [...list].sort((a, b) => (b.enabled ? 1 : 0) - (a.enabled ? 1 : 0));
   }
 
+  // Always watched, regardless of inactivity — see checkInactivity() below —
+  // and always rendered last (both on-page panel and Discord dashboard),
+  // regardless of enabled/disabled state or storage order.
+  const PINNED_PLAYER_IDS = [2209950, 2670154];
+
+  // Display-only ordering (doesn't touch storage): moves any pinned ids to
+  // the very end, after whatever other ordering (e.g. sortEnabledFirst)
+  // already ran.
+  function withPinnedLast(list) {
+    const rest = list.filter((e) => !PINNED_PLAYER_IDS.includes(e.id));
+    const pinned = list.filter((e) => PINNED_PLAYER_IDS.includes(e.id));
+    return [...rest, ...pinned];
+  }
+
+  // Adds any pinned id missing from the watch list (enabled by default) —
+  // runs once at script load so the pinned players are always present
+  // without needing to be added manually.
+  function ensurePinnedPlayersWatched() {
+    const list = getWatchList();
+    let changed = false;
+    for (const id of PINNED_PLAYER_IDS) {
+      if (!list.some((e) => e.id === id)) {
+        list.push({ id, enabled: true });
+        changed = true;
+      }
+    }
+    if (changed) setWatchList(list);
+  }
+
   GM_registerMenuCommand('📋 Set Watched Player IDs', () => {
     const current = getWatchList().map((e) => e.id).join(', ');
     const input = prompt('Enter player IDs to watch, comma-separated (e.g. 1234567, 2345678):', current);
@@ -475,7 +504,7 @@
   // out of this entirely — Discord only shows who's actually being
   // monitored right now.
   function buildDiscordContent() {
-    const list = getWatchList().filter((e) => e.enabled);
+    const list = withPinnedLast(getWatchList().filter((e) => e.enabled));
     const footer = `_from: ${getDeviceName()}_`;
     const xanaxLine = buildXanaxStockLine();
     if (list.length === 0) return `📍 **Location Watch** — no players currently checked.\n${xanaxLine}\n${footer}`;
@@ -976,6 +1005,8 @@
   // re-enable them automatically if they come back online, since a disabled
   // player is no longer being checked at all.
   function checkInactivity(curr) {
+    if (PINNED_PLAYER_IDS.includes(curr.id)) return;
+
     // Based on elapsed time since last_action.timestamp, not the
     // last_action.status label — a player can sit as "Idle" (tab open,
     // no interaction) for hours without ever reporting "Offline", so
@@ -1298,7 +1329,7 @@
     panel.appendChild(actionsRow);
 
     const fullList = getWatchList();
-    const list = sortEnabledFirst(fullList).filter((e) => e.enabled || showDisabled);
+    const list = withPinnedLast(sortEnabledFirst(fullList)).filter((e) => e.enabled || showDisabled);
     const lastStatus = GM_getValue(LS.lastStatus, {});
 
     if (fullList.length === 0) {
@@ -1354,6 +1385,8 @@
       panel.appendChild(row);
     });
   }
+
+  ensurePinnedPlayersWatched();
 
   // Any tab re-renders whenever the shared state changes, so the panel
   // stays live even in tabs that aren't doing the polling.
