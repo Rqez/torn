@@ -931,7 +931,20 @@
 
   const INACTIVITY_TTL_SEC = 60 * 60; // auto-uncheck after this long offline
 
-  // Auto-disables (unchecks) a player once they've been Offline for over an
+  // Parses Torn's own human-readable last_action.relative string ("3 minutes
+  // ago", "7 hours ago", "2 days ago") into approximate elapsed seconds —
+  // fallback for checkInactivity() below, for profiles where .timestamp
+  // comes back 0/missing while .relative is still populated (observed on
+  // some accounts, seemingly privacy-setting-related).
+  function parseRelativeToSeconds(relative) {
+    if (!relative) return null;
+    const match = /^(\d+)\s*(second|minute|hour|day|month|year)/i.exec(relative.trim());
+    if (!match) return null;
+    const perUnitSec = { second: 1, minute: 60, hour: 3600, day: 86400, month: 30 * 86400, year: 365 * 86400 };
+    return Number(match[1]) * (perUnitSec[match[2].toLowerCase()] || 0);
+  }
+
+  // Auto-disables (unchecks) a player once they've been inactive for over an
   // hour — they still stay on the list (and can be manually re-checked
   // anytime), just stop consuming a check-slot in the round-robin. Doesn't
   // re-enable them automatically if they come back online, since a disabled
@@ -941,9 +954,17 @@
     // last_action.status label — a player can sit as "Idle" (tab open,
     // no interaction) for hours without ever reporting "Offline", so
     // gating on the "Offline" label specifically missed those entirely.
-    if (!curr.lastActionTimestamp) return;
-    const inactiveSec = Date.now() / 1000 - curr.lastActionTimestamp;
-    if (inactiveSec <= INACTIVITY_TTL_SEC) return;
+    // Falls back to parsing .relative when .timestamp itself is falsy —
+    // some profiles report a real relative string ("7 hours ago") but a
+    // zeroed/missing raw timestamp, which otherwise silently bypassed this
+    // check forever regardless of actual elapsed time.
+    let inactiveSec = null;
+    if (curr.lastActionTimestamp) {
+      inactiveSec = Date.now() / 1000 - curr.lastActionTimestamp;
+    } else if (curr.lastActionRelative) {
+      inactiveSec = parseRelativeToSeconds(curr.lastActionRelative);
+    }
+    if (inactiveSec == null || inactiveSec <= INACTIVITY_TTL_SEC) return;
 
     const list = getWatchList();
     const entry = list.find((e) => e.id === curr.id);
