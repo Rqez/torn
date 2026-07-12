@@ -90,7 +90,7 @@
     // tabs open.
     xanaxLock: 'tlw_xanax_lock',
     lastDiscordCreateAt: 'tlw_last_discord_create_at', // safety net — see postNewDiscordMessage()
-    xanaxStock: 'tlw_xanax_stock', // { quantity, cost, updatedAt, zeroAt, source } — last known Canada Xanax stock (source: 'yata' or 'prombot', whichever was freshest)
+    xanaxStock: 'tlw_xanax_stock', // { quantity, cost, updatedAt, zeroAt, spawnAt, source } — last known Canada Xanax stock (source: 'yata' or 'prombot', whichever was freshest)
     showDisabled: 'tlw_show_disabled', // panel-only: whether unchecked players are shown at all
     lastApiCallAt: 'tlw_last_api_call_at', // GM-stored (not in-memory) so the gate holds even across multiple tabs
     serverSecret: 'tlw_server_secret', // must match the server's config.txt sharedSecret= — editable via menu
@@ -675,6 +675,12 @@
   // long before trusting a new candidate again — see the comment in
   // pollCanadaXanaxStock() below for why.
   const XANAX_ZERO_LOCK_MS = 10 * 60 * 1000;
+  // Same race, opposite direction: once Xanax is confirmed to have spawned
+  // (0 -> nonzero), hold that reading (and spawnAt) for this long even if a
+  // candidate still reports 0 — whichever source hasn't caught up to the
+  // real restock yet can otherwise flip the display straight back to 0
+  // moments after it was correctly detected.
+  const XANAX_SPAWN_LOCK_MS = 2 * 60 * 1000;
 
   function gmFetchJson(url) {
     return new Promise((resolve, reject) => {
@@ -794,6 +800,9 @@
     if (prev && prev.quantity === 0 && prev.zeroAt && Date.now() - prev.zeroAt < XANAX_ZERO_LOCK_MS) {
       return;
     }
+    if (prev && prev.quantity > 0 && prev.spawnAt && Date.now() - prev.spawnAt < XANAX_SPAWN_LOCK_MS) {
+      return;
+    }
 
     // Prefer whichever source reports the more recently updated stock.
     const best = candidates.reduce((a, b) => (b.updatedAt > a.updatedAt ? b : a));
@@ -805,8 +814,13 @@
     if (prev && prev.quantity > 0 && best.quantity === 0) {
       zeroAt = Date.now();
     }
+    // Same idea, opposite direction — stamped once when it spawns.
+    let spawnAt = prev ? (prev.spawnAt ?? null) : null;
+    if (prev && prev.quantity === 0 && best.quantity > 0) {
+      spawnAt = Date.now();
+    }
 
-    GM_setValue(LS.xanaxStock, { quantity: best.quantity, cost: best.cost, updatedAt: best.updatedAt, zeroAt, source: best.source });
+    GM_setValue(LS.xanaxStock, { quantity: best.quantity, cost: best.cost, updatedAt: best.updatedAt, zeroAt, spawnAt, source: best.source });
     renderPanel();
 
     // The local GM_setValue/panel update above runs on every device/tab
