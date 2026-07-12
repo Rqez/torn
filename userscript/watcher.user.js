@@ -504,9 +504,16 @@
   // get created on every single check in the past. This server is on the
   // same LAN/personal box, so an extra request per check is cheap;
   // correctness matters far more here than saving a round trip.
+  // Returns undefined (not null) when the server couldn't be reached at
+  // all — distinct from a successful response confirming no message id yet.
+  // Collapsing both cases to the same falsy value is what caused duplicate
+  // dashboard messages: a transient server hiccup would look identical to
+  // "no message exists", so the caller would create a brand new one instead
+  // of just skipping that sync and retrying shortly after.
   async function getSharedDiscordMessageId() {
     const res = await serverRequest('/api/discord-message-id', { deviceId: getDeviceId() });
-    return (res && res.discordMessageId) || null;
+    if (!res) return undefined;
+    return res.discordMessageId || null;
   }
 
   async function setSharedDiscordMessageId(id) {
@@ -584,6 +591,11 @@
     if (!webhook) return;
     const content = buildDiscordContent();
     const messageId = await getSharedDiscordMessageId();
+
+    if (messageId === undefined) {
+      console.warn('[TLW] Could not reach the watcher server for the dashboard message id — skipping this sync rather than risking a duplicate message.');
+      return;
+    }
 
     if (!messageId) {
       await postNewDiscordMessage(webhook, content);
