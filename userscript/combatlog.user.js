@@ -137,7 +137,7 @@
   function buildPanel() {
     panel = document.createElement('div');
     panel.style.cssText = `
-      position: fixed; bottom: 10px; right: 10px; width: 340px; max-height: 400px;
+      position: fixed; bottom: 10px; left: 10px; width: 340px; max-height: 400px;
       background: #1e1e1e; color: #eee; font: 12px/1.4 monospace; z-index: 999999;
       border: 1px solid #555; border-radius: 6px; box-shadow: 0 2px 10px rgba(0,0,0,.5);
       display: flex; flex-direction: column; overflow: hidden;
