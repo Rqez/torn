@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Torn Fight Log Watcher
 // @namespace    local.torn.fight-logger
-// @version      0.1.0
+// @version      0.2.0
 // @description  Watches an open attack page and logs visible fight activity (joins, hits, results) as they happen. Only reads what Torn already renders on screen.
 // @match        https://www.torn.com/page.php?sid=attack&user2ID=*
 // @match        https://www.torn.com/loader.php?sid=attack&user2ID=*
@@ -12,24 +12,13 @@
 (function () {
   'use strict';
 
-  // ---------------------------------------------------------------------
-  // CONFIG — adjust SELECTORS if the fallback scanner warns that it can't
-  // find a known log container. Open devtools on the attack page, find the
-  // element that wraps the round-by-round fight log, and add its selector
-  // here (most specific match first).
-  // ---------------------------------------------------------------------
   const CONFIG = {
-    candidateSelectors: [
-      '.chatLogWrapper',            // old attack page log wrapper (historical)
-      '[class*="logWrapper"]',
-      '[class*="log-wrap"]',
-      '[class*="attackLog"]',
-      '[class*="fightLog"]',
-      '[class*="chat-log"]',
-      'main',                       // last-resort broad fallback
-    ],
     profileLinkPattern: /profiles\.php\?XID=(\d+)/i,
-    pollMs: 1000, // fallback poller in case MutationObserver misses SPA route swaps
+    // Phrasing lifted directly from the real Action log (see screenshot):
+    // "X hit Y with his Bat in the Groin for 14", "X fired 7 rounds ... hitting Y ... for 451",
+    // "X initiated an attack against Y".
+    eventPattern: /\b(hit|hitting|fired|missed|initiated an attack|joined|left the fight|hospitali[sz]ed|mugged|defeated|knocked \w+ out|fled|surrender(?:ed)?)\b/i,
+    panelMarker: 'data-torn-fight-log-ui',
   };
 
   const STORAGE_KEY = 'tornFightLog:' + (new URLSearchParams(location.search).get('user2ID') || 'unknown');
@@ -56,18 +45,32 @@
     return new Date().toISOString();
   }
 
+  function depth(el) {
+    let d = 0;
+    while (el.parentElement) {
+      d++;
+      el = el.parentElement;
+    }
+    return d;
+  }
+
   function extractFromNode(node) {
     if (!(node instanceof Element)) return;
-    const text = node.textContent.trim();
-    if (!text || text.length > 500) return; // skip empty / huge blobs
+    if (node.closest('[' + CONFIG.panelMarker + ']')) return; // ignore our own panel
+
+    const text = node.textContent.trim().replace(/\s+/g, ' ');
+    if (!text || text.length > 300) return; // skip empty / huge blobs
     if (seenText.has(text)) return;
 
-    // Only treat this as a log line if it looks like an event: mentions an
-    // attack/hit/join/leave/result word, or contains a profile link.
     const link = node.querySelector && node.querySelector('a[href*="profiles.php?XID="]');
-    const looksLikeEvent = /attack|hit|joined|left|hospitali[sz]ed|mugged|assist|defeat|knocked out|fled|surrender/i.test(text);
-
+    const looksLikeEvent = CONFIG.eventPattern.test(text);
     if (!link && !looksLikeEvent) return;
+
+    // Skip wrapper elements whose text is just an already-logged line plus
+    // extra stuff (e.g. a <tr> wrapping an already-captured <td>).
+    for (const e of entries) {
+      if (text.length > e.text.length && text.includes(e.text)) return;
+    }
 
     let name = null, id = null;
     if (link) {
@@ -86,48 +89,38 @@
 
   function scanAddedNode(node) {
     if (!(node instanceof Element)) return;
-    extractFromNode(node);
-    node.querySelectorAll('*').forEach(extractFromNode);
+    const all = [node, ...node.querySelectorAll('*')];
+    all.sort((a, b) => depth(b) - depth(a)); // deepest/leaf elements first
+    all.forEach(extractFromNode);
   }
 
-  let observedRoot = null;
-
-  function findRoot() {
-    for (const sel of CONFIG.candidateSelectors) {
-      const el = document.querySelector(sel);
-      if (el) return { el, sel };
-    }
-    return null;
-  }
+  let currentObserver = null;
+  let observedBody = null;
 
   function attachObserver() {
-    const found = findRoot();
-    if (!found) {
-      console.warn('[TornFightLog] No known log container found yet. Retrying...');
-      return false;
-    }
-    if (observedRoot === found.el) return true; // already watching this node
+    if (observedBody === document.body && currentObserver) return;
 
-    observedRoot = found.el;
-    console.log('[TornFightLog] Watching container:', found.sel, found.el);
+    if (currentObserver) currentObserver.disconnect();
+    observedBody = document.body;
 
-    const observer = new MutationObserver(mutations => {
+    currentObserver = new MutationObserver(mutations => {
       for (const mut of mutations) {
         mut.addedNodes.forEach(scanAddedNode);
+        // Some frameworks mutate text/attributes in place instead of adding
+        // nodes; re-scan the mutation target too so edits aren't missed.
+        if (mut.type === 'characterData' && mut.target.parentElement) {
+          extractFromNode(mut.target.parentElement);
+        }
       }
     });
-    observer.observe(found.el, { childList: true, subtree: true });
+    currentObserver.observe(document.body, { childList: true, subtree: true, characterData: true });
+    console.log('[TornFightLog] Watching document.body for fight activity.');
 
-    // pick up anything already on screen when we attach
-    scanAddedNode(found.el);
-    return true;
+    scanAddedNode(document.body); // pick up anything already on screen
   }
 
-  // Retry attaching (attack pages are SPA-ish; the log container may not
-  // exist at document-idle yet, or gets replaced on route changes).
-  const attachTimer = setInterval(() => {
-    attachObserver();
-  }, CONFIG.pollMs);
+  // document.body can in principle be swapped by a framework; cheap safety net.
+  const rebindTimer = setInterval(attachObserver, 2000);
 
   // ---------------------------------------------------------------------
   // On-page panel: shows captured entries, lets you copy/export/clear.
@@ -136,6 +129,7 @@
 
   function buildPanel() {
     panel = document.createElement('div');
+    panel.setAttribute(CONFIG.panelMarker, '1');
     panel.style.cssText = `
       position: fixed; bottom: 10px; left: 10px; width: 340px; max-height: 400px;
       background: #1e1e1e; color: #eee; font: 12px/1.4 monospace; z-index: 999999;
@@ -200,5 +194,8 @@
   renderPanel();
   attachObserver();
 
-  window.addEventListener('beforeunload', () => clearInterval(attachTimer));
+  window.addEventListener('beforeunload', () => {
+    clearInterval(rebindTimer);
+    if (currentObserver) currentObserver.disconnect();
+  });
 })();
