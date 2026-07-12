@@ -16,6 +16,8 @@
 // @connect      yata.yt
 // @connect      prombot.co.uk
 // @connect      canadaxanax.duckdns.org
+// @downloadURL  https://github.com/Rqez/torn/blob/main/userscript/watcher.user.js
+// @updateURL    https://github.com/Rqez/torn/blob/main/userscript/watcher.user.js
 // @run-at       document-idle
 // ==/UserScript==
 
@@ -935,16 +937,20 @@
   // re-enable them automatically if they come back online, since a disabled
   // player is no longer being checked at all.
   function checkInactivity(curr) {
-    if (curr.lastActionStatus !== 'Offline' || !curr.lastActionTimestamp) return;
-    const offlineSec = Date.now() / 1000 - curr.lastActionTimestamp;
-    if (offlineSec <= INACTIVITY_TTL_SEC) return;
+    // Based on elapsed time since last_action.timestamp, not the
+    // last_action.status label — a player can sit as "Idle" (tab open,
+    // no interaction) for hours without ever reporting "Offline", so
+    // gating on the "Offline" label specifically missed those entirely.
+    if (!curr.lastActionTimestamp) return;
+    const inactiveSec = Date.now() / 1000 - curr.lastActionTimestamp;
+    if (inactiveSec <= INACTIVITY_TTL_SEC) return;
 
     const list = getWatchList();
     const entry = list.find((e) => e.id === curr.id);
     if (entry && entry.enabled) {
       entry.enabled = false;
       setWatchList(list);
-      console.log(`[TLW] Auto-unchecked ${curr.name} (#${curr.id}) — offline for over 1 hour.`);
+      console.log(`[TLW] Auto-unchecked ${curr.name} (#${curr.id}) — inactive for over 1 hour.`);
     }
   }
 
