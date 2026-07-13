@@ -178,7 +178,7 @@
   // Always watched, regardless of inactivity — see checkInactivity() below —
   // and always rendered last (both on-page panel and Discord dashboard),
   // regardless of enabled/disabled state or storage order.
-  const PINNED_PLAYER_IDS = [2209950, 2670154, 3573857];
+  const PINNED_PLAYER_IDS = [2209950, 2670154];
 
   // Display-only ordering (doesn't touch storage): moves any pinned ids to
   // the very end, after whatever other ordering (e.g. sortEnabledFirst)
@@ -1116,6 +1116,14 @@
     return !wasAlreadyReturning && RETURNING_RE.test(curr.description || '');
   }
 
+  // True for "Traveling to Canada", "In Canada", and "Returning to Torn from
+  // Canada" — used by checkAllPlayersNow() below to uncheck anyone with no
+  // current Canada connection.
+  function isCanadaRelated(description) {
+    const d = (description || '').toLowerCase();
+    return d.includes('to canada') || d.includes('in canada') || d.includes('from canada');
+  }
+
   function notifyLeavingCanadaForTorn(curr) {
     console.log(`[TLW] ${curr.name} (${curr.id}) is heading back to Torn from Canada.`);
     if (isNotifySuppressed()) {
@@ -1204,6 +1212,10 @@
   // players previously auto-unchecked for inactivity, so the API actually
   // re-evaluates them — checkInactivity() inside checkOnePlayer() then
   // unchecks anyone still offline for over an hour based on the fresh data.
+  // Once every check is in, also unchecks anyone with no CURRENT Canada
+  // connection (not traveling to/in/from Canada) — this list exists to
+  // track the Canada run, not every watched player's every move. Pinned
+  // players (see PINNED_PLAYER_IDS) are exempt from this too.
   // Runs regardless of Start/Stop, since it's a one-off manual action, not
   // the background polling loop. Lives as a button in the on-page panel
   // rather than the Tampermonkey menu.
@@ -1233,6 +1245,25 @@
         console.error(`[TLW] Manual check failed for #${entry.id}:`, e.message);
       }
     }
+
+    const lastStatus = GM_getValue(LS.lastStatus, {});
+    const refreshedList = getWatchList();
+    let uncheckedCount = 0;
+    for (const entry of refreshedList) {
+      if (!entry.enabled || PINNED_PLAYER_IDS.includes(entry.id)) continue;
+      const s = lastStatus[entry.id];
+      // No status at all (this check failed and we've never seen them
+      // before) — leave alone rather than uncheck on zero evidence.
+      if (s && !isCanadaRelated(s.description)) {
+        entry.enabled = false;
+        uncheckedCount++;
+      }
+    }
+    if (uncheckedCount > 0) {
+      setWatchList(refreshedList);
+      console.log(`[TLW] Check-all: unchecked ${uncheckedCount} player(s) with no current Canada connection.`);
+    }
+
     console.log('[TLW] Manual check-all complete.');
   }
 
