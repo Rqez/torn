@@ -82,6 +82,7 @@
     apiKeys: 'tlw_api_keys', // array of up to CONFIG.maxApiKeys key strings, all on your own account
     watchList: 'tlw_watch_list',   // array of { id, enabled }
     lastStatus: 'tlw_last_status', // { [id]: { name, state, description } }
+    running: 'tlw_running', // gates the player-watching loop only — defaults to stopped
     lock: 'tlw_lock',
     // Separate lock, independent of `lock` above — the Xanax poll runs on
     // its own timer, completely independent of the main player-watching
@@ -177,7 +178,7 @@
   // Always watched, regardless of inactivity — see checkInactivity() below —
   // and always rendered last (both on-page panel and Discord dashboard),
   // regardless of enabled/disabled state or storage order.
-  const PINNED_PLAYER_IDS = [2209950, 2670154];
+  const PINNED_PLAYER_IDS = [2209950, 2670154, 3573857];
 
   // Display-only ordering (doesn't touch storage): moves any pinned ids to
   // the very end, after whatever other ordering (e.g. sortEnabledFirst)
@@ -372,17 +373,14 @@
     });
   }
 
-  // True unless another device currently holds the lead — gates whether
-  // this device's loop actually polls.
-  //
-  // Starts false and stays false until the FIRST successful heartbeat
-  // confirms otherwise — deliberately NOT defaulting to true, because if
-  // this device can never actually reach the server (wrong URL, firewall,
-  // Tampermonkey never approved the connection, etc.), heartbeatTick()
-  // never gets a chance to correct it, and it would otherwise sit there
-  // believing it's the leader forever — running head-to-head with whatever
-  // the server or another device is doing, with neither one ever standing
-  // down.
+  // True only while the MOST RECENT heartbeat actively confirmed this
+  // device leads — gates whether the player-watching loop does anything at
+  // all, and whether Discord gets updated (see syncDiscordMessage()/
+  // sendTransientDiscordAlert()). Never just carries forward a past belief:
+  // starts false, and heartbeatTick() resets it to false on any failed
+  // heartbeat too (not just a failed FIRST one) — so this device must
+  // continuously reconfirm leadership with the server to keep running, and
+  // it never runs standalone off a stale "I was active last time" state.
   let isDeviceActive = false;
   let hasEverHeartbeatSucceeded = false;
 
@@ -403,18 +401,20 @@
       priority: getDevicePriority(),
     });
     if (!res) {
+      // Must actively reconfirm leadership with the server on every single
+      // heartbeat to keep running — never coast on a stale "I was active
+      // last time" belief. Otherwise a device that WAS leading, hit a
+      // transient server hiccup, and got reassigned in the meantime (or the
+      // server just went down entirely) would keep acting as leader
+      // standalone, un-verified, possibly fighting another device that's
+      // now actually in charge.
+      isDeviceActive = false;
       if (!hasEverHeartbeatSucceeded) {
-        // Never once reached the server — almost certainly a wrong URL,
-        // firewall, or an unapproved cross-origin request, not a transient
-        // blip. Standing by (isDeviceActive was never set true to begin
-        // with) rather than guessing active, so this device can't end up
-        // fighting the server or another device for the lead.
         console.warn('[TLW] Heartbeat has never succeeded — check the watcher server URL/connectivity (Tampermonkey may be prompting for a connection permission). Standing by until it can be confirmed.');
       } else {
-        // Server unreachable — keep doing whatever we were already doing
-        // rather than guessing; the next heartbeat will sort it out.
-        console.warn('[TLW] Heartbeat failed — watcher server unreachable.');
+        console.warn('[TLW] Heartbeat failed — watcher server unreachable. Standing down until leadership can be reconfirmed.');
       }
+      if (wasActive) renderPanel();
       return;
     }
     hasEverHeartbeatSucceeded = true;
@@ -606,6 +606,12 @@
   let discordSyncInFlight = false;
 
   async function syncDiscordMessage() {
+    // Guarded here rather than at every call site — checkOnePlayer() is also
+    // called by checkAllPlayersNow() (the panel's manual "Check all" button),
+    // which deliberately runs regardless of Start/Stop/leadership, and had no
+    // isDeviceActive check of its own. Without this, a standing-by device
+    // could still edit the shared dashboard, racing with whoever's leading.
+    if (!isDeviceActive) return;
     if (discordSyncInFlight) return;
     discordSyncInFlight = true;
     try {
@@ -675,6 +681,11 @@
   // shouldn't get the boxed embed treatment (which is also the only reason
   // the persistent dashboard message uses one, to render its masked link).
   function sendTransientDiscordAlert(content) {
+    // Same reasoning as the guard in syncDiscordMessage() above — notifyChange()
+    // (fired from checkOnePlayer(), including via the manual "Check all"
+    // button) had no leadership check, so a standing-by device could still
+    // post state-change pings to the shared channel.
+    if (!isDeviceActive) return;
     const webhook = getDiscordWebhook();
     if (!webhook) return;
     GM_xmlhttpRequest({
@@ -1184,6 +1195,9 @@
 
     GM_setValue(LS.notifySuppressUntil, Date.now() + CHECK_ALL_NOTIFY_SUPPRESS_MS);
     console.log(`[TLW] Manually checking all ${list.length} player(s)... (notifications suppressed for ${CHECK_ALL_NOTIFY_SUPPRESS_MS / 60_000} minutes)`);
+    if (!isDeviceActive) {
+      console.log('[TLW] This device is standing by — local data will refresh, but Discord updates are suppressed until it leads.');
+    }
     for (const entry of list) {
       try {
         await checkOnePlayer(entry.id);
@@ -1272,7 +1286,9 @@
 
     const title = document.createElement('div');
     title.style.cssText = 'font-weight:bold;';
-    title.textContent = isDeviceActive ? '📍 Location Watch' : '📍 Location Watch (standing by)';
+    title.textContent = !isRunning()
+      ? '📍 Location Watch (stopped)'
+      : (isDeviceActive ? '📍 Location Watch' : '📍 Location Watch (standing by)');
     headerRow.appendChild(title);
 
     const showDisabled = getShowDisabled();
@@ -1393,19 +1409,25 @@
   GM_addValueChangeListener(LS.lastStatus, renderPanel);
   GM_addValueChangeListener(LS.watchList, renderPanel);
   GM_addValueChangeListener(LS.xanaxStock, renderPanel);
+  GM_addValueChangeListener(LS.running, renderPanel);
   renderPanel();
 
   pollCanadaXanaxStock();
   setInterval(pollCanadaXanaxStock, CONFIG.yataPollMs);
 
   // ════════════════════════════════════════════════════════════
-  //  MAIN LOOP — always runs once the page loads. No more Start/Stop menu:
-  //  if there's nothing to check yet (no keys, no watch list), it just
-  //  idles and logs a warning until you add some via the panel/menu.
+  //  MAIN LOOP — gated by Start/Stop (defaults to stopped) so a bad config
+  //  or a suspected bug can be killed instantly without disabling the whole
+  //  userscript. Everything else (Xanax poll, heartbeat, panel) keeps
+  //  running regardless — this only gates the Torn API player-checking loop.
   // ════════════════════════════════════════════════════════════
 
+  function isRunning() {
+    return GM_getValue(LS.running, false);
+  }
+
   async function loop() {
-    while (true) {
+    while (isRunning()) {
       if (getApiKeys().length === 0) {
         console.warn('[TLW] No API keys set. Use the Tampermonkey menu "Set Torn API Keys".');
         await sleep(CONFIG.checkGapMs);
@@ -1446,7 +1468,30 @@
       const wait = CONFIG.checkGapMs - (Date.now() - tickStart);
       if (wait > 0) await sleep(wait);
     }
+    console.log('[TLW] Stopped.');
   }
 
-  loop();
+  GM_registerMenuCommand('▶ Start Location Watch', () => {
+    if (isRunning()) return;
+    if (getApiKeys().length === 0) {
+      alert('Set at least one Torn API key first (Tampermonkey menu → "Set Torn API Keys").');
+      return;
+    }
+    if (getWatchList().length === 0) {
+      alert('Set at least one player ID first (Tampermonkey menu → "Set Watched Player IDs").');
+      return;
+    }
+    GM_setValue(LS.lock, null);
+    GM_setValue(LS.running, true);
+    console.log('[TLW] Started.');
+    loop();
+  });
+
+  GM_registerMenuCommand('⏹ Stop Location Watch', () => {
+    GM_setValue(LS.running, false);
+  });
+
+  if (isRunning()) {
+    loop();
+  }
 })();
