@@ -681,10 +681,11 @@
   // shouldn't get the boxed embed treatment (which is also the only reason
   // the persistent dashboard message uses one, to render its masked link).
   function sendTransientDiscordAlert(content) {
-    // Same reasoning as the guard in syncDiscordMessage() above — notifyChange()
-    // (fired from checkOnePlayer(), including via the manual "Check all"
-    // button) had no leadership check, so a standing-by device could still
-    // post state-change pings to the shared channel.
+    // Same reasoning as the guard in syncDiscordMessage() above —
+    // notifyLeavingCanadaForTorn() (fired from checkOnePlayer(), including
+    // via the manual "Check all" button) had no leadership check, so a
+    // standing-by device could still post state-change pings to the shared
+    // channel.
     if (!isDeviceActive) return;
     const webhook = getDiscordWebhook();
     if (!webhook) return;
@@ -824,6 +825,24 @@
     }
   }
 
+  // Fired once, right when Xanax spawns (0 -> nonzero) — same reminder
+  // webhook as fireXanaxFlyReminder() above, but a separate plain ping
+  // rather than a reminder-bot command.
+  function fireXanaxSpawnPing() {
+    GM_xmlhttpRequest({
+      method: 'POST',
+      url: `${EMBEDDED_REMINDER_WEBHOOK}?wait=true`,
+      headers: { 'Content-Type': 'application/json' },
+      data: JSON.stringify({ content: '@everyone SPAWN GOGOGOGO' }),
+      onload: (r) => {
+        if (r.status < 200 || r.status >= 300) {
+          console.warn(`[TLW] Xanax spawn ping failed: HTTP ${r.status} — ${r.responseText.slice(0, 200)}`);
+        }
+      },
+      onerror: () => console.warn('[TLW] Xanax spawn ping failed (network error).'),
+    });
+  }
+
   async function pollCanadaXanaxStock() {
     const [yataResult, prombotResult] = await Promise.allSettled([
       fetchYataCanadaXanax(),
@@ -896,6 +915,7 @@
     // 0 -> nonzero only — repeated nonzero counts don't re-fire, and a
     // stale/repeated 0 doesn't either.
     if (prev && prev.quantity === 0 && best.quantity > 0) {
+      fireXanaxSpawnPing();
       sendTransientDiscordAlert(`💊 **Xanax restocked in Canada** — ${best.quantity.toLocaleString()} available @ $${best.cost.toLocaleString()} each`);
     }
     // Keep the persistent dashboard message current too, not just the
@@ -1086,13 +1106,23 @@
     return Date.now() < GM_getValue(LS.notifySuppressUntil, 0);
   }
 
-  function notifyChange(prev, curr) {
-    console.log(`[TLW] ${curr.name} (${curr.id}): ${prev.state} -> ${curr.state} — ${curr.description}`);
+  // Torn phrases the description as "Returning to Torn from Canada" for the
+  // whole return leg — checked against prev too, so this only fires once,
+  // right as that leg starts, not on every subsequent poll while still
+  // mid-flight.
+  function isLeavingCanadaForTorn(prev, curr) {
+    const RETURNING_RE = /returning to torn from canada/i;
+    const wasAlreadyReturning = prev && RETURNING_RE.test(prev.description || '');
+    return !wasAlreadyReturning && RETURNING_RE.test(curr.description || '');
+  }
+
+  function notifyLeavingCanadaForTorn(curr) {
+    console.log(`[TLW] ${curr.name} (${curr.id}) is heading back to Torn from Canada.`);
     if (isNotifySuppressed()) {
       console.log(`[TLW] Suppressing Discord alert for ${curr.name} — recent "Check all" cooldown active.`);
       return;
     }
-    sendTransientDiscordAlert(`🔔 **${curr.name}**: ${prev.state} → ${curr.state}${curr.description ? ` (${curr.description})` : ''}`);
+    sendTransientDiscordAlert(`🛫 **${curr.name}** is heading back to Torn from Canada!`);
   }
 
   // Fired for the first observation of a player (on Start, or when newly
@@ -1146,13 +1176,11 @@
         GM_setValue(LS.lastStatus, lastStatus);
         notifyBaseline(curr);
       } else {
-        // Only the state (Okay/Hospital/Jail/Traveling/Abroad/Federal) drives
-        // a notification. description is ignored here on purpose — while
-        // hospitalised it contains a countdown that changes every check,
-        // which would otherwise fire a "change" notification constantly.
-        // We still always re-save name/description below so the on-page
-        // panel reflects the latest countdown/location text.
-        if (prev.state !== curr.state) notifyChange(prev, curr);
+        // The only Discord ping tied to a player's own status — every other
+        // state change (Okay/Hospital/Jail/Traveling/Abroad/Federal, or any
+        // other description change) is deliberately silent; the Xanax
+        // restock alert (see pollCanadaXanaxStock()) is the only other one.
+        if (isLeavingCanadaForTorn(prev, curr)) notifyLeavingCanadaForTorn(curr);
         lastStatus[id] = {
           name: curr.name,
           state: curr.state,
