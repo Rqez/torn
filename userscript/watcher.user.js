@@ -1165,10 +1165,19 @@
   }
 
   async function checkOnePlayer(id) {
-    const lastStatus = GM_getValue(LS.lastStatus, {});
     try {
       const curr = await fetchStatus(id);
       if (!curr) return;
+
+      // Read fresh here, right before mutating/writing, with no further
+      // await until the GM_setValue below — reading this at the TOP of the
+      // function (before the fetchStatus() network round trip) meant a
+      // concurrent checkOnePlayer() call for a DIFFERENT player (e.g. from
+      // checkAllPlayersNow() running alongside the background loop, or a
+      // second tab) could write its own update in between, and this call
+      // would then clobber it with a stale whole-object snapshot —
+      // reverting that other player back to their previous state.
+      const lastStatus = GM_getValue(LS.lastStatus, {});
       const prev = lastStatus[id];
       if (!prev) {
         // First time seeing this player — record a baseline and notify,
