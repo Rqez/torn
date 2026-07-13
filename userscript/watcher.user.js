@@ -504,9 +504,15 @@
   // out of this entirely — Discord only shows who's actually being
   // monitored right now.
   function buildDiscordContent() {
-    const list = withPinnedLast(getWatchList().filter((e) => e.enabled));
     const footer = `_from: ${getDeviceName()}_`;
     const xanaxLine = buildXanaxStockLine();
+    // The Xanax poll runs independently of Start/Stop and calls this on its
+    // own timer regardless, so without this check the dashboard would keep
+    // re-rendering the (frozen, no-longer-updating) player list every cycle
+    // after Stop, with nothing indicating player-watching had actually
+    // stopped — looking exactly like it was still running.
+    if (!isRunning()) return `📍 **Location Watch** — stopped.\n${xanaxLine}\n${footer}`;
+    const list = withPinnedLast(getWatchList().filter((e) => e.enabled));
     if (list.length === 0) return `📍 **Location Watch** — no players currently checked.\n${xanaxLine}\n${footer}`;
     const lastStatus = GM_getValue(LS.lastStatus, {});
     const lines = list.map((entry) => {
