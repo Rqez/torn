@@ -1112,18 +1112,18 @@
     return Date.now() < GM_getValue(LS.notifySuppressUntil, 0);
   }
 
-  // Torn phrases the description as "Returning to Torn from Canada" for the
-  // whole return leg — checked against prev too, so this only fires once,
-  // right as that leg starts, not on every subsequent poll while still
-  // mid-flight.
+  // Torn phrases the description as "Traveling from Canada to Torn" for the
+  // whole return leg (confirmed from a live profile) — checked against prev
+  // too, so this only fires once, right as that leg starts, not on every
+  // subsequent poll while still mid-flight.
   function isLeavingCanadaForTorn(prev, curr) {
-    const RETURNING_RE = /returning to torn from canada/i;
+    const RETURNING_RE = /traveling from canada to torn/i;
     const wasAlreadyReturning = prev && RETURNING_RE.test(prev.description || '');
     return !wasAlreadyReturning && RETURNING_RE.test(curr.description || '');
   }
 
-  // True for "Traveling to Canada", "In Canada", and "Returning to Torn from
-  // Canada" — used by checkAllPlayersNow() below to uncheck anyone with no
+  // True for "Traveling to Canada", "In Canada", and "Traveling from Canada
+  // to Torn" — used by checkAllPlayersNow() below to uncheck anyone with no
   // current Canada connection.
   function isCanadaRelated(description) {
     const d = (description || '').toLowerCase();
