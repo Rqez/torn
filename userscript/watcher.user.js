@@ -48,6 +48,7 @@
     watchList: 'tlw_watch_list', // array of { id, enabled }, staged locally until you Push
     showDisabled: 'tlw_show_disabled', // panel-only: whether unchecked players are shown at all
     serverSecret: 'tlw_server_secret', // must match the server's config.txt sharedSecret= — editable via menu
+    lastStatus: 'tlw_last_status', // { [id]: { name, state, description, lastActionRelative, lastActionTimestamp } } — read-only display cache, snapshotted from the server on each Pull
   };
 
   // ════════════════════════════════════════════════════════════
@@ -240,6 +241,9 @@
     const watchList = Array.isArray(res.watchList) ? res.watchList : [];
     GM_setValue(LS.apiKeys, apiKeys);
     GM_setValue(LS.watchList, watchList);
+    // Read-only snapshot for display only — not staged/pushed, just shows
+    // what the server last saw for each player.
+    GM_setValue(LS.lastStatus, res.lastStatus && typeof res.lastStatus === 'object' ? res.lastStatus : {});
     renderPanel();
     alert(`Pulled ${apiKeys.length} key(s) and ${watchList.length} player(s) from the server, overwriting this device's local list.`);
   }
@@ -259,9 +263,31 @@
 
   // ════════════════════════════════════════════════════════════
   //  ON-PAGE PANEL — local staging area for API keys/watch list, plus
-  //  Push/Pull/Check All buttons. Doesn't show live player status — this
-  //  device doesn't know it anymore; see the Discord dashboard for that.
+  //  Push/Pull/Check All buttons. Name/status shown below is a read-only
+  //  snapshot from the last Pull, not live — the server is the only thing
+  //  that actually knows current status; see its Discord dashboard for that.
   // ════════════════════════════════════════════════════════════
+
+  // Torn's own human-readable relative time ("3 minutes ago") — falls back
+  // to a simple computed version from the raw timestamp if relative wasn't
+  // present in the pulled snapshot for some reason.
+  function timeAgo(unixSeconds) {
+    const diffSec = Math.max(0, Date.now() / 1000 - unixSeconds);
+    if (diffSec < 60) return 'just now';
+    const mins = Math.floor(diffSec / 60);
+    if (mins < 60) return `${mins}m ago`;
+    const hours = Math.floor(mins / 60);
+    if (hours < 24) return `${hours}h ago`;
+    const days = Math.floor(hours / 24);
+    return `${days}d ago`;
+  }
+
+  function formatLastAction(s) {
+    if (!s) return null;
+    if (s.lastActionRelative) return s.lastActionRelative;
+    if (s.lastActionTimestamp) return timeAgo(s.lastActionTimestamp);
+    return null;
+  }
 
   function escapeHtml(s) {
     return String(s == null ? '' : s)
@@ -343,6 +369,7 @@
 
     const fullList = getWatchList();
     const list = sortEnabledFirst(fullList).filter((e) => e.enabled || showDisabled);
+    const lastStatus = GM_getValue(LS.lastStatus, {});
 
     if (fullList.length === 0) {
       const empty = document.createElement('div');
@@ -370,9 +397,17 @@
       checkbox.style.cssText = 'cursor:pointer;flex-shrink:0;margin-top:2px;';
       checkbox.addEventListener('change', () => toggleWatched(entry.id, checkbox.checked));
 
+      const s = lastStatus[entry.id];
+      const name = escapeHtml((s && s.name) || `#${entry.id}`);
+      const lastAction = escapeHtml(formatLastAction(s) || '');
+      const statusLine = s
+        ? escapeHtml(s.description || s.state)
+        : '<span style="opacity:0.7">unknown — Pull to refresh</span>';
+
       const label = document.createElement('div');
       label.style.cssText = (entry.enabled ? '' : 'opacity:0.4;text-decoration:line-through;') + 'flex:1;min-width:0;';
-      label.innerHTML = `<a href="${tornProfileUrl(entry.id)}" target="_blank" rel="noopener noreferrer" style="color:inherit;text-decoration:underline;"><b>#${escapeHtml(entry.id)}</b></a>`;
+      label.innerHTML = `<a href="${tornProfileUrl(entry.id)}" target="_blank" rel="noopener noreferrer" style="color:inherit;text-decoration:underline;"><b>${name}</b></a>`
+        + `${lastAction ? ` <span style="opacity:0.55;font-size:10px;">(${lastAction})</span>` : ''}: ${statusLine}`;
 
       const trash = document.createElement('span');
       trash.textContent = '🗑️';
