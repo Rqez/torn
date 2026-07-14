@@ -96,6 +96,7 @@
     lastApiCallAt: 'tlw_last_api_call_at', // GM-stored (not in-memory) so the gate holds even across multiple tabs
     serverSecret: 'tlw_server_secret', // must match the server's config.txt sharedSecret= — editable via menu
     notifySuppressUntil: 'tlw_notify_suppress_until', // set by checkAllPlayersNow() — see CHECK_ALL_NOTIFY_SUPPRESS_MS
+    lastAutoCheckAllForZeroAt: 'tlw_last_auto_checkall_zero_at', // the xanaxStock.zeroAt already handled — see maybeAutoFireCheckAll()
     deviceId: 'tlw_device_id',
     deviceName: 'tlw_device_name',
     devicePriority: 'tlw_device_priority', // lower number = higher priority; default (unset) = 100
@@ -202,6 +203,28 @@
       }
     }
     if (changed) setWatchList(list);
+  }
+
+  // Called from pollCanadaXanaxStock() the moment Xanax hits 0 — nothing to
+  // do in Canada until it restocks, so stop burning API calls checking
+  // everyone. Pinned players are exempt, same as everywhere else. Monitoring
+  // resumes via maybeAutoFireCheckAll() re-running checkAllPlayersNow(),
+  // which re-enables everyone to re-check them and re-applies the Canada
+  // filter — see below.
+  function stopMonitoringAllPlayers() {
+    const list = getWatchList();
+    let changed = false;
+    for (const entry of list) {
+      if (PINNED_PLAYER_IDS.includes(entry.id)) continue;
+      if (entry.enabled) {
+        entry.enabled = false;
+        changed = true;
+      }
+    }
+    if (changed) {
+      setWatchList(list);
+      console.log('[TLW] Xanax hit 0 — stopped monitoring all players until the next automatic Check All.');
+    }
   }
 
   GM_registerMenuCommand('📋 Set Watched Player IDs', () => {
@@ -740,6 +763,10 @@
   // real restock yet can otherwise flip the display straight back to 0
   // moments after it was correctly detected.
   const XANAX_SPAWN_LOCK_MS = 2 * 60 * 1000;
+  // How long after the "Fly at" time (itself zeroAt + XANAX_FLY_DELAY_MS) to
+  // automatically re-run the Canada-filtered Check All — see
+  // maybeAutoFireCheckAll() below.
+  const AUTO_CHECK_ALL_DELAY_AFTER_FLY_MS = 23 * 60 * 1000;
 
   function gmFetchJson(url) {
     return new Promise((resolve, reject) => {
@@ -900,14 +927,20 @@
     GM_setValue(LS.xanaxStock, { quantity: best.quantity, cost: best.cost, updatedAt: best.updatedAt, zeroAt, spawnAt, source: best.source });
     renderPanel();
 
-    // The local GM_setValue/panel update above runs on every device/tab
-    // regardless of leadership (harmless, purely local display) — but the
-    // Discord side must not: this poll runs on its own timer, completely
-    // independent of the Start/Stop loop and its isDeviceActive gating, so
-    // without these checks every device AND every tab on the leading
-    // device would independently detect the same restock and post its own
-    // duplicate alert, all fighting over editing the same dashboard
-    // message.
+    // Local watch-list mutation, same as checkInactivity() — runs on every
+    // device/tab regardless of leadership, right alongside the other local
+    // updates above.
+    if (prev && prev.quantity > 0 && best.quantity === 0) {
+      stopMonitoringAllPlayers();
+    }
+
+    // The local updates above run on every device/tab regardless of
+    // leadership (harmless, purely local) — but the Discord side must not:
+    // this poll runs on its own timer, completely independent of the
+    // Start/Stop loop and its isDeviceActive gating, so without these checks
+    // every device AND every tab on the leading device would independently
+    // detect the same restock and post its own duplicate alert, all
+    // fighting over editing the same dashboard message.
     if (!isDeviceActive) return;
     if (!claimXanaxLock()) return;
 
@@ -928,6 +961,35 @@
     // on-page panel — otherwise it'd only pick up the new count on the
     // next player check.
     await syncDiscordMessage();
+  }
+
+  // Runs on its own timer (see setInterval below), independent of
+  // pollCanadaXanaxStock()'s early-return branches (the zero-lock window is
+  // exactly when this needs to keep checking whether it's time yet).
+  // Derives the fire time straight from the persisted zeroAt rather than a
+  // separately-scheduled timer, so it survives page reloads — and tracks
+  // which zeroAt it already fired for (LS.lastAutoCheckAllForZeroAt) so it
+  // fires exactly once per zero event, not on every tick after the time
+  // passes.
+  function maybeAutoFireCheckAll() {
+    const xanax = GM_getValue(LS.xanaxStock, null);
+    if (!xanax || !xanax.zeroAt) return;
+
+    const fireAt = xanax.zeroAt + XANAX_FLY_DELAY_MS + AUTO_CHECK_ALL_DELAY_AFTER_FLY_MS;
+    if (Date.now() < fireAt) return;
+
+    if (GM_getValue(LS.lastAutoCheckAllForZeroAt, null) === xanax.zeroAt) return;
+    GM_setValue(LS.lastAutoCheckAllForZeroAt, xanax.zeroAt);
+
+    // checkAllPlayersNow() alert()s on missing keys/watch list — fine for its
+    // manual button, not for an unattended timer firing in the background.
+    if (getApiKeys().length === 0 || getWatchList().length === 0) {
+      console.log('[TLW] Skipping auto Check All — no API keys or watch list configured yet.');
+      return;
+    }
+
+    console.log('[TLW] Auto-firing Check All (23 min after the Fly-at reminder) to resume monitoring and re-apply the Canada filter.');
+    checkAllPlayersNow();
   }
 
   // ════════════════════════════════════════════════════════════
@@ -1233,7 +1295,10 @@
   // players (see PINNED_PLAYER_IDS) are exempt from this too.
   // Runs regardless of Start/Stop, since it's a one-off manual action, not
   // the background polling loop. Lives as a button in the on-page panel
-  // rather than the Tampermonkey menu.
+  // rather than the Tampermonkey menu. Also fired automatically — see
+  // maybeAutoFireCheckAll() — 23 minutes after the "Fly at" reminder, to
+  // resume monitoring after stopMonitoringAllPlayers() paused everyone when
+  // Xanax hit 0.
   async function checkAllPlayersNow() {
     if (getApiKeys().length === 0) {
       alert('Set at least one Torn API key first.');
@@ -1488,6 +1553,9 @@
 
   pollCanadaXanaxStock();
   setInterval(pollCanadaXanaxStock, CONFIG.yataPollMs);
+
+  maybeAutoFireCheckAll();
+  setInterval(maybeAutoFireCheckAll, CONFIG.yataPollMs);
 
   // ════════════════════════════════════════════════════════════
   //  MAIN LOOP — gated by Start/Stop (defaults to stopped) so a bad config
