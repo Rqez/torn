@@ -20,7 +20,7 @@
   // ════════════════════════════════════════════════════════════
 
   const CONFIG = {
-    defaultPollIntervalSec: 5,
+    defaultPollIntervalSec: 1,
     realertCooldownMs: 15 * 60_000, // don't re-notify the same item again within this window while it stays cheap
     lockTtlMultiplier: 2,           // a leader that's gone quiet this long (x poll interval) is assumed dead
   };
@@ -296,7 +296,7 @@
     });
 
     intervalRow.querySelector('#w3b-interval').addEventListener('change', (e) => {
-      const v = Math.max(3, Math.round(Number(e.target.value) || CONFIG.defaultPollIntervalSec));
+      const v = Math.max(1, Math.round(Number(e.target.value) || CONFIG.defaultPollIntervalSec));
       GM_setValue(LS.pollIntervalSec, v);
       e.target.value = String(v);
     });
