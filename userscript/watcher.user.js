@@ -261,6 +261,18 @@
     }
   }
 
+  // Instant — unlike Check All, this doesn't check anyone first, it just
+  // stops monitoring every player on the server's current watch list.
+  async function requestUncheckAll() {
+    if (!confirm('Uncheck every player on the server\'s watch list?')) return;
+    const res = await serverRequest('/api/uncheck-all', {});
+    if (res && res.ok) {
+      alert('All players unchecked on the server.');
+    } else {
+      alert('Uncheck All request failed — see the browser console for details.');
+    }
+  }
+
   // ════════════════════════════════════════════════════════════
   //  ON-PAGE PANEL — local staging area for API keys/watch list, plus
   //  Push/Pull/Check All buttons. Name/status shown below is a read-only
@@ -361,6 +373,7 @@
       return btn;
     };
     actionsRow.appendChild(makeActionButton('🔄 Check All', 'Ask the server to check everyone and re-apply the Canada filter now', requestCheckAll));
+    actionsRow.appendChild(makeActionButton('🚫 Uncheck All', "Stop monitoring every player on the server's watch list", requestUncheckAll));
     actionsRow.appendChild(makeActionButton('⬆️ Push', "Push this device's local API keys/watch list to the server, overwriting it", pushToServer));
     actionsRow.appendChild(makeActionButton('⬇️ Pull', "Pull the API keys/watch list from the server, overwriting this device's local list", pullFromServer));
     actionsRow.appendChild(makeActionButton('🔑 +Key', 'Add one Torn API key (local, then Push)', addOneApiKey));
