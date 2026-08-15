@@ -8,6 +8,8 @@
 // @grant        GM_notification
 // @grant        GM_setValue
 // @grant        GM_getValue
+// @downloadURL  https://github.com/Rqez/torn/blob/main/userscript/weav3rbazaarwatcher.user.js
+// @updateURL    https://github.com/Rqez/torn/blob/main/userscript/weav3rbazaarwatcher.user.js
 // @connect      weav3r.dev
 // @run-at       document-idle
 // ==/UserScript==
@@ -93,9 +95,11 @@
     });
   }
 
-  // weav3r renders listings server-side, price-ascending, inside
-  // <tr class="item-table-row ...">...<td>...$price...$total...</td></tr>.
-  // The first row is therefore the cheapest available listing.
+  // weav3r embeds the raw listings as JSON alongside the rendered table
+  // (inside the page's RSC payload, escaped as \"listings\":[...]). Reading
+  // that directly — rather than scraping table rows — sidesteps sponsored
+  // rows (marked "sponsored":true, always shown first regardless of price)
+  // and any future reordering/markup changes to the visible table.
   async function fetchCheapestListing(id) {
     const url = `https://weav3r.dev/item/${id}?mode=buy&tab=all&timeframe=7d`;
     const res = await gmGet(url);
@@ -108,20 +112,29 @@
     const titleMatch = html.match(/<title>TornW3B \| ([^<]+)<\/title>/);
     if (titleMatch) name = titleMatch[1];
 
-    const rowMatch = html.match(/<tr class="item-table-row[\s\S]*?<\/tr>/);
-    if (!rowMatch) {
+    const unescaped = html.replace(/\\"/g, '"');
+    const listingsMatch = unescaped.match(/"listings":(\[[^\]]*\])/);
+    if (!listingsMatch) {
       return { name, price: null, seller: null, sellerUrl: null };
     }
-    const row = rowMatch[0];
 
-    const priceMatch = row.match(/\$([\d,]+)/);
-    const price = priceMatch ? Number(priceMatch[1].replace(/,/g, '')) : null;
+    let listings;
+    try {
+      listings = JSON.parse(listingsMatch[1]);
+    } catch {
+      return { name, price: null, seller: null, sellerUrl: null };
+    }
 
-    const sellerMatch = row.match(/<a href="([^"]+)"[^>]*>([^<]+)<!-- -->\s*\[(\d+)\]<\/a>/);
-    const seller = sellerMatch ? `${sellerMatch[2]} [${sellerMatch[3]}]` : null;
-    const sellerUrl = sellerMatch ? sellerMatch[1] : null;
+    const real = listings.filter((l) => !l.sponsored && Number.isFinite(l.price));
+    if (real.length === 0) {
+      return { name, price: null, seller: null, sellerUrl: null };
+    }
 
-    return { name, price, seller, sellerUrl };
+    const cheapest = real.reduce((min, l) => (l.price < min.price ? l : min));
+    const seller = cheapest.playerName ? `${cheapest.playerName} [${cheapest.playerId}]` : null;
+    const sellerUrl = cheapest.playerId ? `https://www.torn.com/bazaar.php?userId=${cheapest.playerId}` : null;
+
+    return { name, price: cheapest.price, seller, sellerUrl };
   }
 
   // ════════════════════════════════════════════════════════════
