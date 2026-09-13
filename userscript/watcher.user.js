@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Torn Player Location Watcher
 // @namespace    tc-location-watch
-// @version      5.0
-// @description  Thin remote control for the server-side Torn Watcher (see torn-watcher-server/). Edit your API keys and watched player IDs locally, then Push/Pull them to the server and trigger an on-demand Canada-filtered Check All. All actual monitoring — Torn API polling, Xanax stock tracking, Discord posting — now runs 24/7 on the server itself, not in this browser tab.
+// @version      5.1
+// @description  Thin remote control for the server-side Torn Watcher (see torn-watcher-server/). Edit your API keys, watched player IDs, and a separate permanent watch list locally, then Push/Pull them to the server and trigger an on-demand Canada-filtered Check All. All actual monitoring — Torn API polling, Xanax stock tracking, Discord posting — now runs 24/7 on the server itself, not in this browser tab.
 // @match        https://weav3r.dev/*
 // @grant        GM_xmlhttpRequest
 // @grant        GM_setValue
@@ -46,9 +46,10 @@
   const LS = {
     apiKeys: 'tlw_api_keys', // array of up to CONFIG.maxApiKeys key strings, staged locally until you Push
     watchList: 'tlw_watch_list', // array of { id, enabled }, staged locally until you Push
+    permanentWatchList: 'tlw_permanent_watch_list', // array of player IDs, staged locally until you Push — watched forever on the server, never auto-unchecked
     showDisabled: 'tlw_show_disabled', // panel-only: whether unchecked players are shown at all
     serverSecret: 'tlw_server_secret', // must match the server's config.txt sharedSecret= — editable via menu
-    lastStatus: 'tlw_last_status', // { [id]: { name, state, description, lastActionRelative, lastActionTimestamp } } — read-only display cache, snapshotted from the server on each Pull
+    lastStatus: 'tlw_last_status', // { [id]: { name, state, description, lastActionRelative, lastActionTimestamp } } — read-only display cache, snapshotted from the server on each Pull, shared by both watch lists
   };
 
   // ════════════════════════════════════════════════════════════
@@ -169,6 +170,65 @@
   }
 
   // ════════════════════════════════════════════════════════════
+  //  PERMANENT WATCH LIST — separate from the watch list above: no
+  //  enabled/disabled toggle, no inactivity auto-uncheck, no Canada
+  //  filtering, immune to the Xanax-zero auto-stop. Being on this list
+  //  means the server checks that player forever, until explicitly removed
+  //  here. Staged locally, only takes effect on the server once Pushed —
+  //  same as everything else on this page.
+  // ════════════════════════════════════════════════════════════
+
+  function getPermanentWatchList() {
+    return GM_getValue(LS.permanentWatchList, []);
+  }
+
+  function setPermanentWatchList(list) {
+    GM_setValue(LS.permanentWatchList, list);
+  }
+
+  GM_registerMenuCommand('👁️ Set Permanently Watched Player IDs', () => {
+    const current = getPermanentWatchList().join(', ');
+    const input = prompt(
+      'Enter player IDs to watch permanently, comma-separated (e.g. 1234567, 2345678). These are checked forever and never auto-unchecked. Remember to click Push afterwards:',
+      current
+    );
+    if (input == null) return;
+    const ids = input.split(',')
+      .map((s) => parseInt(s.trim(), 10))
+      .filter((n) => Number.isFinite(n) && n > 0);
+    setPermanentWatchList(ids);
+    renderPanel();
+    alert(ids.length ? `Permanently watching ${ids.length} player(s) locally: ${ids.join(', ')} — click Push to send this to the server.` : 'Permanent watch list cleared locally.');
+  });
+
+  // Quicker than editing the full comma-separated list above — just types
+  // one new ID into a fresh, empty prompt.
+  function addOnePermanentWatchedId() {
+    const input = prompt('Enter one player ID to permanently watch:', '');
+    if (input == null || !input.trim()) return;
+    const id = parseInt(input.trim(), 10);
+    if (!Number.isFinite(id) || id <= 0) {
+      alert('That doesn\'t look like a valid player ID.');
+      return;
+    }
+    const list = getPermanentWatchList();
+    if (list.includes(id)) {
+      alert(`#${id} is already on the permanent watch list.`);
+      return;
+    }
+    list.push(id);
+    setPermanentWatchList(list);
+    renderPanel();
+    alert(`Added #${id}. Now permanently watching ${list.length} player(s) locally — click Push to send this to the server.`);
+  }
+
+  function removePermanentWatched(id) {
+    const list = getPermanentWatchList().filter((existingId) => existingId !== id);
+    setPermanentWatchList(list);
+    renderPanel();
+  }
+
+  // ════════════════════════════════════════════════════════════
   //  SERVER — the server does ALL the actual monitoring/posting now; this
   //  device only pushes/pulls config and can trigger an on-demand Check All.
   // ════════════════════════════════════════════════════════════
@@ -223,9 +283,10 @@
   async function pushToServer() {
     const apiKeys = getApiKeys();
     const watchList = getWatchList();
-    const res = await serverRequest('/api/push', { apiKeys, watchList });
+    const permanentWatchList = getPermanentWatchList();
+    const res = await serverRequest('/api/push', { apiKeys, watchList, permanentWatchList });
     if (res && res.ok) {
-      alert(`Pushed ${apiKeys.length} key(s) and ${watchList.length} player(s) to the server, overwriting what was there.`);
+      alert(`Pushed ${apiKeys.length} key(s), ${watchList.length} player(s), and ${permanentWatchList.length} permanent watch player(s) to the server, overwriting what was there.`);
     } else {
       alert('Push failed — see the browser console for details.');
     }
@@ -239,13 +300,15 @@
     }
     const apiKeys = Array.isArray(res.apiKeys) ? res.apiKeys : [];
     const watchList = Array.isArray(res.watchList) ? res.watchList : [];
+    const permanentWatchList = Array.isArray(res.permanentWatchList) ? res.permanentWatchList : [];
     GM_setValue(LS.apiKeys, apiKeys);
     GM_setValue(LS.watchList, watchList);
+    GM_setValue(LS.permanentWatchList, permanentWatchList);
     // Read-only snapshot for display only — not staged/pushed, just shows
     // what the server last saw for each player.
     GM_setValue(LS.lastStatus, res.lastStatus && typeof res.lastStatus === 'object' ? res.lastStatus : {});
     renderPanel();
-    alert(`Pulled ${apiKeys.length} key(s) and ${watchList.length} player(s) from the server, overwriting this device's local list.`);
+    alert(`Pulled ${apiKeys.length} key(s), ${watchList.length} player(s), and ${permanentWatchList.length} permanent watch player(s) from the server, overwriting this device's local list.`);
   }
 
   // Fire-and-forget — the server checks everyone (rate-gated, one player per
@@ -374,10 +437,11 @@
     };
     actionsRow.appendChild(makeActionButton('🔄 Check All', 'Ask the server to check everyone and re-apply the Canada filter now', requestCheckAll));
     actionsRow.appendChild(makeActionButton('🚫 Uncheck All', "Stop monitoring every player on the server's watch list", requestUncheckAll));
-    actionsRow.appendChild(makeActionButton('⬆️ Push', "Push this device's local API keys/watch list to the server, overwriting it", pushToServer));
-    actionsRow.appendChild(makeActionButton('⬇️ Pull', "Pull the API keys/watch list from the server, overwriting this device's local list", pullFromServer));
+    actionsRow.appendChild(makeActionButton('⬆️ Push', "Push this device's local API keys/watch lists (including Permanent Watch) to the server, overwriting it", pushToServer));
+    actionsRow.appendChild(makeActionButton('⬇️ Pull', "Pull the API keys/watch lists (including Permanent Watch) from the server, overwriting this device's local lists", pullFromServer));
     actionsRow.appendChild(makeActionButton('🔑 +Key', 'Add one Torn API key (local, then Push)', addOneApiKey));
     actionsRow.appendChild(makeActionButton('➕ +ID', 'Add one watched player ID (local, then Push)', addOneWatchedId));
+    actionsRow.appendChild(makeActionButton('👁️ +ID', 'Add one permanently watched player ID (local, then Push)', addOnePermanentWatchedId));
     panel.appendChild(actionsRow);
 
     const fullList = getWatchList();
@@ -389,48 +453,91 @@
       empty.style.opacity = '0.7';
       empty.textContent = 'No players staged locally.';
       panel.appendChild(empty);
-      return;
-    }
-    if (list.length === 0) {
+    } else if (list.length === 0) {
       const empty = document.createElement('div');
       empty.style.opacity = '0.7';
       empty.textContent = 'All unchecked (hidden — click "show unchecked" above).';
       panel.appendChild(empty);
+    } else {
+      list.forEach((entry) => {
+        const row = document.createElement('div');
+        row.style.cssText = 'display:flex;align-items:flex-start;gap:6px;padding:2px 0;';
+
+        const checkbox = document.createElement('input');
+        checkbox.type = 'checkbox';
+        checkbox.checked = entry.enabled;
+        checkbox.title = entry.enabled ? 'Uncheck to exclude from next Push' : 'Check to include in next Push';
+        checkbox.style.cssText = 'cursor:pointer;flex-shrink:0;margin-top:2px;';
+        checkbox.addEventListener('change', () => toggleWatched(entry.id, checkbox.checked));
+
+        const s = lastStatus[entry.id];
+        const name = escapeHtml((s && s.name) || `#${entry.id}`);
+        const lastAction = escapeHtml(formatLastAction(s) || '');
+        const statusLine = s
+          ? escapeHtml(s.description || s.state)
+          : '<span style="opacity:0.7">unknown — Pull to refresh</span>';
+
+        const label = document.createElement('div');
+        label.style.cssText = (entry.enabled ? '' : 'opacity:0.4;text-decoration:line-through;') + 'flex:1;min-width:0;';
+        label.innerHTML = `<a href="${tornProfileUrl(entry.id)}" target="_blank" rel="noopener noreferrer" style="color:inherit;text-decoration:underline;"><b>${name}</b></a>`
+          + `${lastAction ? ` <span style="opacity:0.55;font-size:10px;">(${lastAction})</span>` : ''}: ${statusLine}`;
+
+        const trash = document.createElement('span');
+        trash.textContent = '🗑️';
+        trash.title = 'Remove from local watch list';
+        trash.style.cssText = 'cursor:pointer;flex-shrink:0;margin-left:auto;opacity:0.6;';
+        trash.addEventListener('click', () => {
+          if (confirm(`Remove #${entry.id} from the local watch list?`)) removeWatched(entry.id);
+        });
+
+        row.appendChild(checkbox);
+        row.appendChild(label);
+        row.appendChild(trash);
+        panel.appendChild(row);
+      });
+    }
+
+    // ── Permanent Watch — separate section, own list, no enabled toggle,
+    // always rendered regardless of the main watch list's state above. ──
+    const permanentList = getPermanentWatchList();
+
+    const permanentHeader = document.createElement('div');
+    permanentHeader.style.cssText = 'font-weight:bold;border-top:1px solid #444;margin-top:8px;padding-top:6px;';
+    permanentHeader.textContent = '👁️ Permanent Watch';
+    panel.appendChild(permanentHeader);
+
+    if (permanentList.length === 0) {
+      const empty = document.createElement('div');
+      empty.style.opacity = '0.7';
+      empty.textContent = 'No players permanently watched.';
+      panel.appendChild(empty);
       return;
     }
 
-    list.forEach((entry) => {
+    permanentList.forEach((id) => {
       const row = document.createElement('div');
       row.style.cssText = 'display:flex;align-items:flex-start;gap:6px;padding:2px 0;';
 
-      const checkbox = document.createElement('input');
-      checkbox.type = 'checkbox';
-      checkbox.checked = entry.enabled;
-      checkbox.title = entry.enabled ? 'Uncheck to exclude from next Push' : 'Check to include in next Push';
-      checkbox.style.cssText = 'cursor:pointer;flex-shrink:0;margin-top:2px;';
-      checkbox.addEventListener('change', () => toggleWatched(entry.id, checkbox.checked));
-
-      const s = lastStatus[entry.id];
-      const name = escapeHtml((s && s.name) || `#${entry.id}`);
+      const s = lastStatus[id];
+      const name = escapeHtml((s && s.name) || `#${id}`);
       const lastAction = escapeHtml(formatLastAction(s) || '');
       const statusLine = s
         ? escapeHtml(s.description || s.state)
         : '<span style="opacity:0.7">unknown — Pull to refresh</span>';
 
       const label = document.createElement('div');
-      label.style.cssText = (entry.enabled ? '' : 'opacity:0.4;text-decoration:line-through;') + 'flex:1;min-width:0;';
-      label.innerHTML = `<a href="${tornProfileUrl(entry.id)}" target="_blank" rel="noopener noreferrer" style="color:inherit;text-decoration:underline;"><b>${name}</b></a>`
+      label.style.cssText = 'flex:1;min-width:0;';
+      label.innerHTML = `<a href="${tornProfileUrl(id)}" target="_blank" rel="noopener noreferrer" style="color:inherit;text-decoration:underline;"><b>${name}</b></a>`
         + `${lastAction ? ` <span style="opacity:0.55;font-size:10px;">(${lastAction})</span>` : ''}: ${statusLine}`;
 
       const trash = document.createElement('span');
       trash.textContent = '🗑️';
-      trash.title = 'Remove from local watch list';
+      trash.title = 'Remove from local permanent watch list';
       trash.style.cssText = 'cursor:pointer;flex-shrink:0;margin-left:auto;opacity:0.6;';
       trash.addEventListener('click', () => {
-        if (confirm(`Remove #${entry.id} from the local watch list?`)) removeWatched(entry.id);
+        if (confirm(`Remove #${id} from the local permanent watch list?`)) removePermanentWatched(id);
       });
 
-      row.appendChild(checkbox);
       row.appendChild(label);
       row.appendChild(trash);
       panel.appendChild(row);
@@ -441,5 +548,6 @@
   // panel stays live across tabs on this device.
   GM_addValueChangeListener(LS.watchList, renderPanel);
   GM_addValueChangeListener(LS.apiKeys, renderPanel);
+  GM_addValueChangeListener(LS.permanentWatchList, renderPanel);
   renderPanel();
 })();
