@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Torn Player Location Watcher
 // @namespace    tc-location-watch
-// @version      5.1
+// @version      5.2
 // @description  Thin remote control for the server-side Torn Watcher (see torn-watcher-server/). Edit your API keys, watched player IDs, and a separate permanent watch list locally, then Push/Pull them to the server and trigger an on-demand Canada-filtered Check All. All actual monitoring — Torn API polling, Xanax stock tracking, Discord posting — now runs 24/7 on the server itself, not in this browser tab.
 // @match        https://weav3r.dev/*
 // @grant        GM_xmlhttpRequest
@@ -46,7 +46,7 @@
   const LS = {
     apiKeys: 'tlw_api_keys', // array of up to CONFIG.maxApiKeys key strings, staged locally until you Push
     watchList: 'tlw_watch_list', // array of { id, enabled }, staged locally until you Push
-    permanentWatchList: 'tlw_permanent_watch_list', // array of player IDs, staged locally until you Push — watched forever on the server, never auto-unchecked
+    permanentWatchList: 'tlw_permanent_watch_list', // array of { id, enabled }, staged locally until you Push — checked forever on the server while enabled, never auto-unchecked for inactivity
     showDisabled: 'tlw_show_disabled', // panel-only: whether unchecked players are shown at all
     serverSecret: 'tlw_server_secret', // must match the server's config.txt sharedSecret= — editable via menu
     lastStatus: 'tlw_last_status', // { [id]: { name, state, description, lastActionRelative, lastActionTimestamp } } — read-only display cache, snapshotted from the server on each Pull, shared by both watch lists
@@ -170,12 +170,14 @@
   }
 
   // ════════════════════════════════════════════════════════════
-  //  PERMANENT WATCH LIST — separate from the watch list above: no
-  //  enabled/disabled toggle, no inactivity auto-uncheck, no Canada
-  //  filtering, immune to the Xanax-zero auto-stop. Being on this list
-  //  means the server checks that player forever, until explicitly removed
-  //  here. Staged locally, only takes effect on the server once Pushed —
-  //  same as everything else on this page.
+  //  PERMANENT WATCH LIST — separate from the watch list above: same
+  //  enabled/disabled toggle (check/uncheck to pause/resume without losing
+  //  the entry), but no inactivity auto-uncheck, no Canada filtering, and
+  //  immune to the Xanax-zero auto-stop — only this UI ever changes it.
+  //  Being on this list at all means the server checks that player
+  //  whenever enabled, forever, until explicitly removed here. Staged
+  //  locally, only takes effect on the server once Pushed — same as
+  //  everything else on this page.
   // ════════════════════════════════════════════════════════════
 
   function getPermanentWatchList() {
@@ -187,22 +189,27 @@
   }
 
   GM_registerMenuCommand('👁️ Set Permanently Watched Player IDs', () => {
-    const current = getPermanentWatchList().join(', ');
+    const current = getPermanentWatchList().map((e) => e.id).join(', ');
     const input = prompt(
-      'Enter player IDs to watch permanently, comma-separated (e.g. 1234567, 2345678). These are checked forever and never auto-unchecked. Remember to click Push afterwards:',
+      'Enter player IDs to watch permanently, comma-separated (e.g. 1234567, 2345678). These are checked forever and never auto-unchecked for inactivity. Remember to click Push afterwards:',
       current
     );
     if (input == null) return;
     const ids = input.split(',')
       .map((s) => parseInt(s.trim(), 10))
       .filter((n) => Number.isFinite(n) && n > 0);
-    setPermanentWatchList(ids);
+
+    // Preserve each existing player's enabled/disabled toggle; new entries
+    // default to enabled.
+    const existingEnabled = new Map(getPermanentWatchList().map((e) => [e.id, e.enabled]));
+    const newList = ids.map((id) => ({ id, enabled: existingEnabled.has(id) ? existingEnabled.get(id) : true }));
+    setPermanentWatchList(newList);
     renderPanel();
     alert(ids.length ? `Permanently watching ${ids.length} player(s) locally: ${ids.join(', ')} — click Push to send this to the server.` : 'Permanent watch list cleared locally.');
   });
 
   // Quicker than editing the full comma-separated list above — just types
-  // one new ID into a fresh, empty prompt.
+  // one new ID into a fresh, empty prompt, enabled by default.
   function addOnePermanentWatchedId() {
     const input = prompt('Enter one player ID to permanently watch:', '');
     if (input == null || !input.trim()) return;
@@ -212,18 +219,28 @@
       return;
     }
     const list = getPermanentWatchList();
-    if (list.includes(id)) {
+    if (list.some((e) => e.id === id)) {
       alert(`#${id} is already on the permanent watch list.`);
       return;
     }
-    list.push(id);
+    list.push({ id, enabled: true });
     setPermanentWatchList(list);
     renderPanel();
     alert(`Added #${id}. Now permanently watching ${list.length} player(s) locally — click Push to send this to the server.`);
   }
 
+  // Pauses/resumes checking without removing the entry — unlike the main
+  // watch list, nothing on the server ever flips this automatically.
+  function togglePermanentWatched(id, enabled) {
+    const list = getPermanentWatchList();
+    const entry = list.find((e) => e.id === id);
+    if (!entry) return;
+    entry.enabled = enabled;
+    setPermanentWatchList(list);
+  }
+
   function removePermanentWatched(id) {
-    const list = getPermanentWatchList().filter((existingId) => existingId !== id);
+    const list = getPermanentWatchList().filter((e) => e.id !== id);
     setPermanentWatchList(list);
     renderPanel();
   }
@@ -497,37 +514,53 @@
       });
     }
 
-    // ── Permanent Watch — separate section, own list, no enabled toggle,
-    // always rendered regardless of the main watch list's state above. ──
-    const permanentList = getPermanentWatchList();
+    // ── Permanent Watch — separate section, same enabled/disabled toggle
+    // pattern as the main watch list above, always rendered regardless of
+    // the main watch list's state above. ──
+    const fullPermanentList = getPermanentWatchList();
+    const permanentList = sortEnabledFirst(fullPermanentList).filter((e) => e.enabled || showDisabled);
 
     const permanentHeader = document.createElement('div');
     permanentHeader.style.cssText = 'font-weight:bold;border-top:1px solid #444;margin-top:8px;padding-top:6px;';
     permanentHeader.textContent = '👁️ Permanent Watch';
     panel.appendChild(permanentHeader);
 
-    if (permanentList.length === 0) {
+    if (fullPermanentList.length === 0) {
       const empty = document.createElement('div');
       empty.style.opacity = '0.7';
       empty.textContent = 'No players permanently watched.';
       panel.appendChild(empty);
       return;
     }
+    if (permanentList.length === 0) {
+      const empty = document.createElement('div');
+      empty.style.opacity = '0.7';
+      empty.textContent = 'All unchecked (hidden — click "show unchecked" above).';
+      panel.appendChild(empty);
+      return;
+    }
 
-    permanentList.forEach((id) => {
+    permanentList.forEach((entry) => {
       const row = document.createElement('div');
       row.style.cssText = 'display:flex;align-items:flex-start;gap:6px;padding:2px 0;';
 
-      const s = lastStatus[id];
-      const name = escapeHtml((s && s.name) || `#${id}`);
+      const checkbox = document.createElement('input');
+      checkbox.type = 'checkbox';
+      checkbox.checked = entry.enabled;
+      checkbox.title = entry.enabled ? 'Uncheck to pause checking (stays on the permanent list)' : 'Check to resume checking';
+      checkbox.style.cssText = 'cursor:pointer;flex-shrink:0;margin-top:2px;';
+      checkbox.addEventListener('change', () => togglePermanentWatched(entry.id, checkbox.checked));
+
+      const s = lastStatus[entry.id];
+      const name = escapeHtml((s && s.name) || `#${entry.id}`);
       const lastAction = escapeHtml(formatLastAction(s) || '');
       const statusLine = s
         ? escapeHtml(s.description || s.state)
         : '<span style="opacity:0.7">unknown — Pull to refresh</span>';
 
       const label = document.createElement('div');
-      label.style.cssText = 'flex:1;min-width:0;';
-      label.innerHTML = `<a href="${tornProfileUrl(id)}" target="_blank" rel="noopener noreferrer" style="color:inherit;text-decoration:underline;"><b>${name}</b></a>`
+      label.style.cssText = (entry.enabled ? '' : 'opacity:0.4;text-decoration:line-through;') + 'flex:1;min-width:0;';
+      label.innerHTML = `<a href="${tornProfileUrl(entry.id)}" target="_blank" rel="noopener noreferrer" style="color:inherit;text-decoration:underline;"><b>${name}</b></a>`
         + `${lastAction ? ` <span style="opacity:0.55;font-size:10px;">(${lastAction})</span>` : ''}: ${statusLine}`;
 
       const trash = document.createElement('span');
@@ -535,9 +568,10 @@
       trash.title = 'Remove from local permanent watch list';
       trash.style.cssText = 'cursor:pointer;flex-shrink:0;margin-left:auto;opacity:0.6;';
       trash.addEventListener('click', () => {
-        if (confirm(`Remove #${id} from the local permanent watch list?`)) removePermanentWatched(id);
+        if (confirm(`Remove #${entry.id} from the local permanent watch list?`)) removePermanentWatched(entry.id);
       });
 
+      row.appendChild(checkbox);
       row.appendChild(label);
       row.appendChild(trash);
       panel.appendChild(row);
