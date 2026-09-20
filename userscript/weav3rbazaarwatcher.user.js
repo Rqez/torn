@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Weav3r Item Watcher
 // @namespace    weav3r-item-watch
-// @version      1.3
+// @version      1.4
 // @description  Background-polls weav3r.dev item pages for the cheapest buy-mode listing and alerts (desktop notification + optional Discord webhook + optional auto-opened tab that highlights the item on the seller's bazaar page) when it drops below a per-item threshold. Floating panel (bottom-left) lets you add/edit/remove watched item IDs and thresholds.
 // @match        https://weav3r.dev/*
 // @match        https://www.torn.com/bazaar.php*
@@ -167,6 +167,10 @@
     return seen;
   }
 
+  // Tracks bazaar tabs opened via the auto-open toggle, keyed by seller URL, so a
+  // seller with more than one watched item cheap at once doesn't get a tab each.
+  const openBazaarTabs = new Map();
+
   // Seller bazaar links get a w3b_search param naming the item, so the bazaar-page
   // half of this script (see BAZAAR HIGHLIGHT below) knows what to scroll to and
   // highlight the moment the tab opens.
@@ -197,9 +201,18 @@
       },
     });
     if (getAutoOpenTab()) {
-      // window.open() from a background poll isn't a user gesture and gets popup-blocked;
-      // GM_openInTab is the extension-privileged equivalent of clicking the notification.
-      GM_openInTab(link, { active: true, insert: true, setParent: true });
+      if (sellerUrl) {
+        const existing = openBazaarTabs.get(sellerUrl);
+        if (!existing || existing.closed) {
+          // window.open() from a background poll isn't a user gesture and gets popup-blocked;
+          // GM_openInTab is the extension-privileged equivalent of clicking the notification.
+          const handle = GM_openInTab(link, { active: true, insert: true, setParent: true });
+          handle.onclose = () => openBazaarTabs.delete(sellerUrl);
+          openBazaarTabs.set(sellerUrl, handle);
+        }
+      } else {
+        GM_openInTab(link, { active: true, insert: true, setParent: true });
+      }
     }
     try {
       const ctx = new (window.AudioContext || window.webkitAudioContext)();
