@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Weav3r Item Watcher
 // @namespace    weav3r-item-watch
-// @version      1.5
+// @version      1.6
 // @description  Background-polls weav3r.dev item pages for the cheapest buy-mode listing and alerts (desktop notification + optional Discord webhook + optional auto-opened tab that highlights the item on the seller's bazaar page) when it drops below a per-item threshold. Floating panel (bottom-left) lets you add/edit/remove watched item IDs and thresholds.
 // @match        https://weav3r.dev/*
 // @match        https://www.torn.com/bazaar.php*
@@ -112,45 +112,53 @@
     });
   }
 
-  // weav3r's own frontend hits this JSON endpoint for the listings table — a few KB,
-  // vs. ~280KB for the full rendered item page. sponsored rows are still pinned to
-  // the top regardless of the requested sort, so we still filter + reduce ourselves.
+  // weav3r's dedicated JSON listings API (/api/item/{id}/listings) is ~50x lighter
+  // than this full page, but Cloudflare returns 403 to it specifically when called via
+  // GM_xmlhttpRequest (it's presumably fingerprinting the request as non-browser —
+  // confirmed by testing: a plain fetch() from weav3r.dev's own page JS gets 200, the
+  // same URL via GM_xmlhttpRequest gets 403). The full item page isn't gated the same
+  // way, so that's what we're stuck fetching.
+  //
+  // weav3r embeds the raw listings as JSON alongside the rendered table
+  // (inside the page's RSC payload, escaped as \"listings\":[...]). Reading
+  // that directly — rather than scraping table rows — sidesteps sponsored
+  // rows (marked "sponsored":true, always shown first regardless of price)
+  // and any future reordering/markup changes to the visible table.
   async function fetchCheapestListing(id) {
-    const url = `https://weav3r.dev/api/item/${id}/listings?page=1&limit=25&sortField=price&sortDirection=asc&_t=${Date.now()}`;
+    const url = `https://weav3r.dev/item/${id}?mode=buy&tab=all&timeframe=7d`;
     const res = await gmGet(url);
     if (res.status < 200 || res.status >= 300) {
       throw new Error(`HTTP ${res.status}`);
     }
+    const html = res.responseText;
+
+    let name = null;
+    const titleMatch = html.match(/<title>TornW3B \| ([^<]+)<\/title>/);
+    if (titleMatch) name = titleMatch[1];
+
+    const unescaped = html.replace(/\\"/g, '"');
+    const listingsMatch = unescaped.match(/"listings":(\[[^\]]*\])/);
+    if (!listingsMatch) {
+      return { name, price: null, seller: null, sellerUrl: null };
+    }
 
     let listings;
     try {
-      listings = JSON.parse(res.responseText).listings;
+      listings = JSON.parse(listingsMatch[1]);
     } catch {
-      throw new Error('bad_json');
+      return { name, price: null, seller: null, sellerUrl: null };
     }
-    if (!Array.isArray(listings)) throw new Error('bad_json');
 
     const real = listings.filter((l) => !l.sponsored && Number.isFinite(l.price));
     if (real.length === 0) {
-      return { price: null, seller: null, sellerUrl: null };
+      return { name, price: null, seller: null, sellerUrl: null };
     }
 
     const cheapest = real.reduce((min, l) => (l.price < min.price ? l : min));
     const seller = cheapest.playerName ? `${cheapest.playerName} [${cheapest.playerId}]` : null;
     const sellerUrl = cheapest.playerId ? `https://www.torn.com/bazaar.php?userId=${cheapest.playerId}` : null;
 
-    return { price: cheapest.price, seller, sellerUrl };
-  }
-
-  // The lightweight listings API above doesn't include the item's display name, so
-  // this — the full item page — is only fetched once, lazily, the first time an item
-  // is added by ID and still showing its placeholder name.
-  async function fetchItemName(id) {
-    const url = `https://weav3r.dev/item/${id}?mode=buy&tab=all&timeframe=7d`;
-    const res = await gmGet(url);
-    if (res.status < 200 || res.status >= 300) return null;
-    const titleMatch = res.responseText.match(/<title>TornW3B \| ([^<]+)<\/title>/);
-    return titleMatch ? titleMatch[1] : null;
+    return { name, price: cheapest.price, seller, sellerUrl };
   }
 
   // ════════════════════════════════════════════════════════════
@@ -391,7 +399,7 @@
 
     const intervalRow = el('div', { style: { display: 'flex', gap: '4px', marginTop: '6px', alignItems: 'center' } },
       el('span', {}, 'Poll every'),
-      el('input', { id: 'w3b-interval', type: 'number', step: '0.1', style: 'width:56px', value: String(getPollIntervalSec()) }),
+      el('input', { id: 'w3b-interval', type: 'number', style: 'width:56px', value: String(getPollIntervalSec()) }),
       el('span', {}, 'sec'),
       el('button', { id: 'w3b-check-now', style: { ...btnStyle(), marginLeft: 'auto' } }, 'Check now')
     );
@@ -450,7 +458,7 @@
     });
 
     intervalRow.querySelector('#w3b-interval').addEventListener('change', (e) => {
-      const v = Math.round(Math.max(0.3, Number(e.target.value) || CONFIG.defaultPollIntervalSec) * 10) / 10;
+      const v = Math.max(1, Math.round(Number(e.target.value) || CONFIG.defaultPollIntervalSec));
       GM_setValue(LS.pollIntervalSec, v);
       e.target.value = String(v);
     });
@@ -573,14 +581,11 @@
     const item = list.find((i) => i.id === id);
     if (!item) return;
     try {
-      if (!item.name || item.name === `Item ${id}`) {
-        const name = await fetchItemName(id);
-        if (name && name !== item.name) {
-          item.name = name;
-          saveWatchlist(list);
-        }
+      const { name, price, seller, sellerUrl } = await fetchCheapestListing(id);
+      if (name && name !== item.name) {
+        item.name = name;
+        saveWatchlist(list);
       }
-      const { price, seller, sellerUrl } = await fetchCheapestListing(id);
       statusById[id] = { price, seller, sellerUrl, error: false, checkedAt: Date.now() };
       if (price != null && price <= item.threshold) {
         notify(item, price, seller, sellerUrl);
@@ -597,9 +602,8 @@
     refreshLock();
     const list = getWatchlist();
     setStatus(`Checking ${list.length} item(s)...`);
-    // items are polled concurrently — the lightweight listings API (a few KB each)
-    // makes this cheap, and it keeps the per-item re-check rate from degrading as
-    // the watchlist grows, unlike the old one-at-a-time-with-a-pause loop.
+    // items are polled concurrently rather than one-at-a-time-with-a-pause, so the
+    // per-item re-check rate no longer degrades as the watchlist grows.
     await Promise.all(list.map((item) => pollOne(item.id)));
     setStatus(`Last checked ${new Date().toLocaleTimeString()}`);
   }
