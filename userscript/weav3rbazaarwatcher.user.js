@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Weav3r Item Watcher
 // @namespace    weav3r-item-watch
-// @version      1.6
-// @description  Background-polls weav3r.dev item pages for the cheapest buy-mode listing and alerts (desktop notification + optional Discord webhook + optional auto-opened tab that highlights the item on the seller's bazaar page) when it drops below a per-item threshold. Floating panel (bottom-left) lets you add/edit/remove watched item IDs and thresholds.
+// @version      1.7
+// @description  Background-polls weav3r.dev item pages for buy-mode listings and alerts (desktop notification + optional Discord webhook + optional auto-opened tabs that highlight the item on each seller's bazaar page) for every seller below a per-item threshold, not just the cheapest. Floating panel (bottom-left) lets you add/edit/remove watched item IDs and thresholds.
 // @match        https://weav3r.dev/*
 // @match        https://www.torn.com/bazaar.php*
 // @grant        GM_xmlhttpRequest
@@ -124,7 +124,7 @@
   // that directly — rather than scraping table rows — sidesteps sponsored
   // rows (marked "sponsored":true, always shown first regardless of price)
   // and any future reordering/markup changes to the visible table.
-  async function fetchCheapestListing(id) {
+  async function fetchListings(id) {
     const url = `https://weav3r.dev/item/${id}?mode=buy&tab=all&timeframe=7d`;
     const res = await gmGet(url);
     if (res.status < 200 || res.status >= 300) {
@@ -139,26 +139,26 @@
     const unescaped = html.replace(/\\"/g, '"');
     const listingsMatch = unescaped.match(/"listings":(\[[^\]]*\])/);
     if (!listingsMatch) {
-      return { name, price: null, seller: null, sellerUrl: null };
+      return { name, listings: [] };
     }
 
-    let listings;
+    let rawListings;
     try {
-      listings = JSON.parse(listingsMatch[1]);
+      rawListings = JSON.parse(listingsMatch[1]);
     } catch {
-      return { name, price: null, seller: null, sellerUrl: null };
+      return { name, listings: [] };
     }
 
-    const real = listings.filter((l) => !l.sponsored && Number.isFinite(l.price));
-    if (real.length === 0) {
-      return { name, price: null, seller: null, sellerUrl: null };
-    }
+    const listings = rawListings
+      .filter((l) => !l.sponsored && Number.isFinite(l.price))
+      .sort((a, b) => a.price - b.price)
+      .map((l) => ({
+        price: l.price,
+        seller: l.playerName ? `${l.playerName} [${l.playerId}]` : null,
+        sellerUrl: l.playerId ? `https://www.torn.com/bazaar.php?userId=${l.playerId}` : null,
+      }));
 
-    const cheapest = real.reduce((min, l) => (l.price < min.price ? l : min));
-    const seller = cheapest.playerName ? `${cheapest.playerName} [${cheapest.playerId}]` : null;
-    const sellerUrl = cheapest.playerId ? `https://www.torn.com/bazaar.php?userId=${cheapest.playerId}` : null;
-
-    return { name, price: cheapest.price, seller, sellerUrl };
+    return { name, listings };
   }
 
   // ════════════════════════════════════════════════════════════
@@ -189,18 +189,26 @@
     return `${sellerUrl}${sep}w3b_search=${encodeURIComponent(item.name)}`;
   }
 
-  function notify(item, price, seller, sellerUrl) {
+  // listings: every listing for this item currently at/below threshold, cheapest first.
+  function notify(item, listings) {
+    // dedupe per seller+price (not just item+price, now that more than one seller can
+    // qualify at once) so an unchanged listing doesn't re-alert inside the cooldown,
+    // but a new seller or a further price drop does.
     const seen = loadSeenAlerts();
-    const key = `${item.id}-${price}`;
-    if (seen[key]) return;
-    seen[key] = Date.now();
+    const fresh = listings.filter((l) => !seen[`${item.id}-${l.sellerUrl || 'x'}-${l.price}`]);
+    if (fresh.length === 0) return;
+    for (const l of fresh) {
+      seen[`${item.id}-${l.sellerUrl || 'x'}-${l.price}`] = Date.now();
+    }
     GM_setValue(LS.seenAlerts, seen);
 
-    const link = buildAlertLink(item, sellerUrl);
+    const cheapest = fresh[0];
+    const link = buildAlertLink(item, cheapest.sellerUrl);
+    const extra = fresh.length > 1 ? ` (+${fresh.length - 1} more seller${fresh.length > 2 ? 's' : ''})` : '';
 
     GM_notification({
       title: `Weav3r: ${item.name} deal!`,
-      text: `$${price.toLocaleString()} (below $${item.threshold.toLocaleString()})${seller ? ' — ' + seller : ''}`,
+      text: `$${cheapest.price.toLocaleString()} (below $${item.threshold.toLocaleString()})${cheapest.seller ? ' — ' + cheapest.seller : ''}${extra}`,
       timeout: 25000,
       onclick: () => {
         window.focus();
@@ -208,18 +216,25 @@
       },
     });
     if (getAutoOpenTab()) {
-      if (sellerUrl) {
-        const existing = openBazaarTabs.get(sellerUrl);
-        if (!existing || existing.closed) {
-          // window.open() from a background poll isn't a user gesture and gets popup-blocked;
-          // GM_openInTab is the extension-privileged equivalent of clicking the notification.
-          const handle = GM_openInTab(link, { active: true, insert: true, setParent: true });
-          handle.onclose = () => openBazaarTabs.delete(sellerUrl);
-          openBazaarTabs.set(sellerUrl, handle);
+      let openedFallback = false;
+      fresh.forEach((l, idx) => {
+        const tabLink = buildAlertLink(item, l.sellerUrl);
+        // window.open() from a background poll isn't a user gesture and gets popup-blocked;
+        // GM_openInTab is the extension-privileged equivalent of clicking the notification.
+        // Only the cheapest tab is brought to the front — the rest open behind it so a
+        // burst of qualifying sellers doesn't flip your screen through every tab.
+        if (l.sellerUrl) {
+          const existing = openBazaarTabs.get(l.sellerUrl);
+          if (!existing || existing.closed) {
+            const handle = GM_openInTab(tabLink, { active: idx === 0, insert: true, setParent: true });
+            handle.onclose = () => openBazaarTabs.delete(l.sellerUrl);
+            openBazaarTabs.set(l.sellerUrl, handle);
+          }
+        } else if (!openedFallback) {
+          openedFallback = true;
+          GM_openInTab(tabLink, { active: idx === 0, insert: true, setParent: true });
         }
-      } else {
-        GM_openInTab(link, { active: true, insert: true, setParent: true });
-      }
+      });
     }
     try {
       const ctx = new (window.AudioContext || window.webkitAudioContext)();
@@ -232,22 +247,22 @@
       osc.start();
       osc.stop(ctx.currentTime + 0.4);
     } catch {}
-    sendDiscordAlert(item, price, seller, sellerUrl);
-    console.log(`[W3B] ALERT: ${item.name} (${item.id}) $${price.toLocaleString()}`);
+    sendDiscordAlert(item, fresh);
+    console.log(`[W3B] ALERT: ${item.name} (${item.id}) ${fresh.length} listing(s) below threshold`);
   }
 
-  function sendDiscordAlert(item, price, seller, sellerUrl) {
+  function sendDiscordAlert(item, listings) {
     const webhook = getDiscordWebhook();
     if (!webhook) return;
-    const link = buildAlertLink(item, sellerUrl);
     const payload = {
-      embeds: [{
-        title: `${item.name} deal!`,
-        description: `$${price.toLocaleString()} (below $${item.threshold.toLocaleString()})${seller ? `\nSeller: ${seller}` : ''}`,
-        url: link,
+      // Discord caps embeds at 10 per message
+      embeds: listings.slice(0, 10).map((l) => ({
+        title: `${item.name} — $${l.price.toLocaleString()}`,
+        description: `below $${item.threshold.toLocaleString()}${l.seller ? `\nSeller: ${l.seller}` : ''}`,
+        url: buildAlertLink(item, l.sellerUrl),
         color: 0x3ddc84,
         timestamp: new Date().toISOString(),
-      }],
+      })),
     };
     GM_xmlhttpRequest({
       method: 'POST',
@@ -581,14 +596,22 @@
     const item = list.find((i) => i.id === id);
     if (!item) return;
     try {
-      const { name, price, seller, sellerUrl } = await fetchCheapestListing(id);
+      const { name, listings } = await fetchListings(id);
       if (name && name !== item.name) {
         item.name = name;
         saveWatchlist(list);
       }
-      statusById[id] = { price, seller, sellerUrl, error: false, checkedAt: Date.now() };
-      if (price != null && price <= item.threshold) {
-        notify(item, price, seller, sellerUrl);
+      const cheapest = listings[0] || null;
+      statusById[id] = {
+        price: cheapest ? cheapest.price : null,
+        seller: cheapest ? cheapest.seller : null,
+        sellerUrl: cheapest ? cheapest.sellerUrl : null,
+        error: false,
+        checkedAt: Date.now(),
+      };
+      const qualifying = listings.filter((l) => l.price <= item.threshold);
+      if (qualifying.length > 0) {
+        notify(item, qualifying);
       }
     } catch (e) {
       statusById[id] = { error: true, checkedAt: Date.now() };
