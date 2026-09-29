@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Weav3r Item Watcher
 // @namespace    weav3r-item-watch
-// @version      1.7
-// @description  Background-polls weav3r.dev item pages for buy-mode listings and alerts (desktop notification + optional Discord webhook + optional auto-opened tabs that highlight the item on each seller's bazaar page) for every seller below a per-item threshold, not just the cheapest. Floating panel (bottom-left) lets you add/edit/remove watched item IDs and thresholds.
+// @version      2.2
+// @description  Background-polls weav3r.dev item pages for buy-mode listings and alerts (desktop notification + optional Discord webhook + optional auto-opened tab that highlights the item on the seller's bazaar page) when the cheapest listing drops below a per-item threshold. Floating panel (bottom-left) lets you add/edit/remove watched item IDs and thresholds.
 // @match        https://weav3r.dev/*
 // @match        https://www.torn.com/bazaar.php*
 // @grant        GM_xmlhttpRequest
@@ -48,6 +48,7 @@
 
   const TAB_ID = Math.random().toString(36).slice(2, 10);
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+  const clamp = (value, min, max) => Math.min(Math.max(value, min), max);
 
   // ════════════════════════════════════════════════════════════
   //  WATCHLIST STORAGE
@@ -124,7 +125,7 @@
   // that directly — rather than scraping table rows — sidesteps sponsored
   // rows (marked "sponsored":true, always shown first regardless of price)
   // and any future reordering/markup changes to the visible table.
-  async function fetchListings(id) {
+  async function fetchWeav3rListings(id) {
     const url = `https://weav3r.dev/item/${id}?mode=buy&tab=all&timeframe=7d`;
     const res = await gmGet(url);
     if (res.status < 200 || res.status >= 300) {
@@ -189,26 +190,19 @@
     return `${sellerUrl}${sep}w3b_search=${encodeURIComponent(item.name)}`;
   }
 
-  // listings: every listing for this item currently at/below threshold, cheapest first.
-  function notify(item, listings) {
-    // dedupe per seller+price (not just item+price, now that more than one seller can
-    // qualify at once) so an unchanged listing doesn't re-alert inside the cooldown,
-    // but a new seller or a further price drop does.
+  // listing: the single cheapest listing for this item currently at/below threshold.
+  function notify(item, listing) {
     const seen = loadSeenAlerts();
-    const fresh = listings.filter((l) => !seen[`${item.id}-${l.sellerUrl || 'x'}-${l.price}`]);
-    if (fresh.length === 0) return;
-    for (const l of fresh) {
-      seen[`${item.id}-${l.sellerUrl || 'x'}-${l.price}`] = Date.now();
-    }
+    const key = `${item.id}-${listing.sellerUrl || 'x'}-${listing.price}`;
+    if (seen[key]) return;
+    seen[key] = Date.now();
     GM_setValue(LS.seenAlerts, seen);
 
-    const cheapest = fresh[0];
-    const link = buildAlertLink(item, cheapest.sellerUrl);
-    const extra = fresh.length > 1 ? ` (+${fresh.length - 1} more seller${fresh.length > 2 ? 's' : ''})` : '';
+    const link = buildAlertLink(item, listing.sellerUrl);
 
     GM_notification({
       title: `Weav3r: ${item.name} deal!`,
-      text: `$${cheapest.price.toLocaleString()} (below $${item.threshold.toLocaleString()})${cheapest.seller ? ' — ' + cheapest.seller : ''}${extra}`,
+      text: `$${listing.price.toLocaleString()} (below $${item.threshold.toLocaleString()})${listing.seller ? ' — ' + listing.seller : ''}`,
       timeout: 25000,
       onclick: () => {
         window.focus();
@@ -216,25 +210,18 @@
       },
     });
     if (getAutoOpenTab()) {
-      let openedFallback = false;
-      fresh.forEach((l, idx) => {
-        const tabLink = buildAlertLink(item, l.sellerUrl);
-        // window.open() from a background poll isn't a user gesture and gets popup-blocked;
-        // GM_openInTab is the extension-privileged equivalent of clicking the notification.
-        // Only the cheapest tab is brought to the front — the rest open behind it so a
-        // burst of qualifying sellers doesn't flip your screen through every tab.
-        if (l.sellerUrl) {
-          const existing = openBazaarTabs.get(l.sellerUrl);
-          if (!existing || existing.closed) {
-            const handle = GM_openInTab(tabLink, { active: idx === 0, insert: true, setParent: true });
-            handle.onclose = () => openBazaarTabs.delete(l.sellerUrl);
-            openBazaarTabs.set(l.sellerUrl, handle);
-          }
-        } else if (!openedFallback) {
-          openedFallback = true;
-          GM_openInTab(tabLink, { active: idx === 0, insert: true, setParent: true });
+      // window.open() from a background poll isn't a user gesture and gets popup-blocked;
+      // GM_openInTab is the extension-privileged equivalent of clicking the notification.
+      if (listing.sellerUrl) {
+        const existing = openBazaarTabs.get(listing.sellerUrl);
+        if (!existing || existing.closed) {
+          const handle = GM_openInTab(link, { active: true, insert: true, setParent: true });
+          handle.onclose = () => openBazaarTabs.delete(listing.sellerUrl);
+          openBazaarTabs.set(listing.sellerUrl, handle);
         }
-      });
+      } else {
+        GM_openInTab(link, { active: true, insert: true, setParent: true });
+      }
     }
     try {
       const ctx = new (window.AudioContext || window.webkitAudioContext)();
@@ -247,22 +234,21 @@
       osc.start();
       osc.stop(ctx.currentTime + 0.4);
     } catch {}
-    sendDiscordAlert(item, fresh);
-    console.log(`[W3B] ALERT: ${item.name} (${item.id}) ${fresh.length} listing(s) below threshold`);
+    sendDiscordAlert(item, listing);
+    console.log(`[W3B] ALERT: ${item.name} (${item.id}) $${listing.price.toLocaleString()}`);
   }
 
-  function sendDiscordAlert(item, listings) {
+  function sendDiscordAlert(item, listing) {
     const webhook = getDiscordWebhook();
     if (!webhook) return;
     const payload = {
-      // Discord caps embeds at 10 per message
-      embeds: listings.slice(0, 10).map((l) => ({
-        title: `${item.name} — $${l.price.toLocaleString()}`,
-        description: `below $${item.threshold.toLocaleString()}${l.seller ? `\nSeller: ${l.seller}` : ''}`,
-        url: buildAlertLink(item, l.sellerUrl),
+      embeds: [{
+        title: `${item.name} deal!`,
+        description: `$${listing.price.toLocaleString()} (below $${item.threshold.toLocaleString()})${listing.seller ? `\nSeller: ${listing.seller}` : ''}`,
+        url: buildAlertLink(item, listing.sellerUrl),
         color: 0x3ddc84,
         timestamp: new Date().toISOString(),
-      })),
+      }],
     };
     GM_xmlhttpRequest({
       method: 'POST',
@@ -384,8 +370,14 @@
 
     const pos = GM_getValue(LS.panelPos, null);
     if (pos) {
-      panel.style.left = pos.left;
-      panel.style.top = pos.top;
+      // clamp on restore too, in case a bad position (e.g. dragged above the
+      // viewport, making the header unreachable) was already saved
+      const margin = 24;
+      const panelWidth = parseFloat(panel.style.width) || 340;
+      const leftNum = parseFloat(pos.left);
+      const topNum = parseFloat(pos.top);
+      panel.style.left = `${Number.isFinite(leftNum) ? clamp(leftNum, margin - panelWidth, window.innerWidth - margin) : 12}px`;
+      panel.style.top = `${Number.isFinite(topNum) ? clamp(topNum, 0, window.innerHeight - margin) : 12}px`;
     } else {
       panel.style.left = '12px';
       panel.style.bottom = '12px';
@@ -575,8 +567,12 @@
     });
     window.addEventListener('mousemove', (e) => {
       if (!dragging) return;
-      const left = startLeft + (e.clientX - startX);
-      const top = startTop + (e.clientY - startY);
+      // keep at least `margin` px of the panel on-screen so the header (the only
+      // drag handle) can never end up somewhere the mouse can't reach
+      const margin = 24;
+      const panelWidth = parseFloat(panel.style.width) || 340;
+      const left = clamp(startLeft + (e.clientX - startX), margin - panelWidth, window.innerWidth - margin);
+      const top = clamp(startTop + (e.clientY - startY), 0, window.innerHeight - margin);
       panel.style.left = `${left}px`;
       panel.style.top = `${top}px`;
     });
@@ -596,7 +592,7 @@
     const item = list.find((i) => i.id === id);
     if (!item) return;
     try {
-      const { name, listings } = await fetchListings(id);
+      const { name, listings } = await fetchWeav3rListings(id);
       if (name && name !== item.name) {
         item.name = name;
         saveWatchlist(list);
@@ -609,9 +605,8 @@
         error: false,
         checkedAt: Date.now(),
       };
-      const qualifying = listings.filter((l) => l.price <= item.threshold);
-      if (qualifying.length > 0) {
-        notify(item, qualifying);
+      if (cheapest && cheapest.price <= item.threshold) {
+        notify(item, cheapest);
       }
     } catch (e) {
       statusById[id] = { error: true, checkedAt: Date.now() };
