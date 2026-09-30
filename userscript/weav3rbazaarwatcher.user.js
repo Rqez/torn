@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Weav3r Item Watcher
 // @namespace    weav3r-item-watch
-// @version      2.4
-// @description  Background-polls weav3r.dev item pages for buy-mode listings and alerts (desktop notification + optional Discord webhook + optional auto-opened tab that highlights the item on the seller's bazaar page) when the cheapest listing drops below a per-item threshold. Also has a "Check all" button that scans every tradeable item above $10k market value (via the Torn API) for bazaar listings 20% or more below market price. Floating panel (bottom-left) lets you add/edit/remove watched item IDs and thresholds.
+// @version      3.4
+// @description  Background-polls weav3r.dev item pages for buy-mode listings and alerts (desktop notification + optional Discord webhook + optional auto-opened tab that highlights the item on the seller's bazaar page) when the cheapest listing drops below a per-item threshold. Also has a "Check all" button that scans every tradeable item between $100k and $15m market value (via the Torn API) for bazaar listings 20% or more below market price, a $100k+ per-unit gap to a trader's buy price, or a profitable bulk flip — a "Check Flushies" button that scans every Plushie/Flower (above $1k market value) for any bazaar at least 1% below market — and an optional background auto-scanner for Plushies/Flowers that alerts (and can auto-open tabs) on listings at least 2% below market with more than 25 units available. Floating panel (bottom-left) lets you add/edit/remove watched item IDs and thresholds.
 // @match        https://weav3r.dev/*
 // @match        https://www.torn.com/bazaar.php*
 // @grant        GM_xmlhttpRequest
@@ -30,9 +30,22 @@
     realertCooldownMs: 15 * 60_000, // don't re-notify the same item again within this window while it stays cheap
     lockTtlMultiplier: 2,           // a leader that's gone quiet this long (x poll interval) is assumed dead
     checkAllDiscountFactor: 0.8,    // "check all" flags listings at/below 80% of market value (20% under)
-    checkAllMinMarketValue: 10_000, // skip items cheaper than this — not worth the scan time
+    checkAllMinMarketValue: 100_000, // skip items cheaper than this — not worth the scan time
+    checkAllMaxMarketValue: 15_000_000, // skip items pricier than this
     checkAllBatchSize: 5,           // items fetched concurrently per batch during a "check all" scan
     checkAllBatchPauseMs: 500,      // gap between batches — a full scan is hundreds of items, pace it gently
+    flipMinPriceGap: 100_000,       // ping if a trader's buy price beats the cheapest sell by at least this much
+    flipMinTotalProfit: 100_000,    // ping if flipping the sell listing's full quantity nets at least this much
+    flipMinProfitRatio: 100_000 / 4_000_000, // "100k profit for every 4mil spent" — minimum 2.5% margin
+    flipCheckPaceMs: 2000,          // gap between individual trader-search requests — weav3r rate-limits this
+                                     // endpoint hard ("Too many deal searches"), far stricter than the listings one
+    flipCheckBackoffMs: 60_000,     // how long to pause entirely after a 429 before resuming trader searches
+    flushiesDiscountFactor: 0.99,   // "check flushies" flags listings at/below 99% of market value (1% under)
+    flushiesMinMarketValue: 1_000,  // skip plushies/flowers cheaper than this
+    flushiesAutoDiscountFactor: 0.98, // auto-scan trigger: at/below 98% of market (2% under) — stricter than the
+                                     // manual "Check Flushies" button's 1%, since this one can open tabs on its own
+    flushiesAutoMinQuantity: 25,    // ...and only when more than this many units are available in one listing
+    flushiesAutoScanIntervalMs: 5_000, // how often the background auto-scan re-checks all plushies/flowers
   };
 
   const DEFAULT_WATCHLIST = [
@@ -50,6 +63,7 @@
     discordWebhook: 'w3b_discord_webhook',
     autoOpenTab: 'w3b_auto_open_tab',
     tornApiKey: 'w3b_torn_api_key',
+    flushiesAutoScan: 'w3b_flushies_auto_scan',
   };
 
   const TAB_ID = Math.random().toString(36).slice(2, 10);
@@ -111,6 +125,10 @@
     GM_setValue(LS.tornApiKey, key.trim());
   }
 
+  function getFlushiesAutoScan() {
+    return GM_getValue(LS.flushiesAutoScan, false);
+  }
+
   // ════════════════════════════════════════════════════════════
   //  FETCH + PARSE
   // ════════════════════════════════════════════════════════════
@@ -125,6 +143,19 @@
         ontimeout: () => reject(new Error('timeout')),
       });
     });
+  }
+
+  // Plain same-origin fetch, for weav3r.dev URLs only. GM_xmlhttpRequest is dispatched
+  // through the extension's own context, and weav3r's Cloudflare rules 403 that for
+  // every /api/ route we've tried (confirmed twice now) even though the identical URL
+  // works fine as a normal page fetch. This script's polling/check-all logic only ever
+  // runs while the current tab is actually on weav3r.dev (see INIT), so a real fetch()
+  // here is genuinely same-origin — no CORS issue, and it goes through the browser's
+  // normal fetch path instead of the extension's, which is what Cloudflare seems to be
+  // keying off. Not a substitute for gmGet() cross-origin (Discord, Torn's API).
+  async function pageGet(url) {
+    const res = await fetch(url);
+    return { status: res.status, responseText: await res.text() };
   }
 
   // weav3r's dedicated JSON listings API (/api/item/{id}/listings) is ~50x lighter
@@ -169,6 +200,7 @@
       .sort((a, b) => a.price - b.price)
       .map((l) => ({
         price: l.price,
+        quantity: Number.isFinite(l.quantity) ? l.quantity : 0,
         seller: l.playerName ? `${l.playerName} [${l.playerId}]` : null,
         sellerUrl: l.playerId ? `https://www.torn.com/bazaar.php?userId=${l.playerId}` : null,
       }));
@@ -176,10 +208,52 @@
     return { name, listings };
   }
 
-  // Torn's own official API — the only place a "market price for every item" list
-  // exists (weav3r only gives per-item bazaar listings, not a catalogue). Cached in
-  // memory for the page session since the item catalogue barely changes and there's
-  // no reason to re-fetch it on every "Check all" click.
+  // Traders with an active pricelist offering to BUY this item — the flip side of the
+  // listings above. This is the mode=sell tab's data, but that tab only populates via a
+  // client-side call to this endpoint; a direct page fetch of ?mode=sell never includes
+  // it server-rendered, unlike the buy-side listings. Response shape confirmed directly:
+  // {"deals":[{playerId, playerName, price, rating:{...}, pricelistId, lastTrade,
+  // lastAction}]}. Uses pageGet (plain same-origin fetch), not gmGet — this /api/ route
+  // 403'd unconditionally via GM_xmlhttpRequest, confirmed fixed by switching to a plain
+  // fetch(). But it has its own much stricter rate limit at the application level
+  // ("Too many deal searches. Please slow down.", confirmed live) — callers must pace
+  // these requests far more gently than the listings endpoint; see checkAll's flip phase.
+  async function fetchWeav3rTraders(id) {
+    const url = `https://weav3r.dev/api/search-deals/find?id=${id}&type=item`;
+    const res = await pageGet(url);
+    if (res.status === 429) {
+      throw new Error('rate_limited');
+    }
+    if (res.status < 200 || res.status >= 300) {
+      throw new Error(`HTTP ${res.status}`);
+    }
+
+    let data;
+    try {
+      data = JSON.parse(res.responseText);
+    } catch {
+      throw new Error('bad_json');
+    }
+    const deals = Array.isArray(data.deals) ? data.deals : [];
+
+    const traders = deals
+      .filter((d) => Number.isFinite(d.price))
+      .sort((a, b) => b.price - a.price) // highest bidder first
+      .map((d) => ({
+        price: d.price,
+        seller: d.playerName ? `${d.playerName} [${d.playerId}]` : null,
+        sellerUrl: d.playerId ? `https://www.torn.com/bazaar.php?userId=${d.playerId}` : null,
+      }));
+
+    return { traders };
+  }
+
+  // Torn's own official API — the only place a "market price (and category) for every
+  // item" list exists (weav3r only gives per-item bazaar listings, not a catalogue).
+  // Cached in memory for the page session since the item catalogue barely changes and
+  // there's no reason to re-fetch it on every scan. Returns the full catalogue
+  // unfiltered by value — each scan (check-all, check-flushies) applies its own filter
+  // on top, so they can share this one fetch instead of each needing their own.
   let itemsCatalogueCache = null;
   async function fetchAllItemsCatalog() {
     if (itemsCatalogueCache) return itemsCatalogueCache;
@@ -201,8 +275,8 @@
     }
 
     const catalogue = Object.entries(data.items || {})
-      .map(([id, info]) => ({ id: Number(id), name: info.name, marketValue: info.market_value }))
-      .filter((i) => Number.isFinite(i.marketValue) && i.marketValue > CONFIG.checkAllMinMarketValue);
+      .map(([id, info]) => ({ id: Number(id), name: info.name, type: info.type, marketValue: info.market_value }))
+      .filter((i) => Number.isFinite(i.marketValue) && i.marketValue > 0);
 
     itemsCatalogueCache = catalogue;
     return catalogue;
@@ -236,28 +310,35 @@
     return `${sellerUrl}${sep}w3b_search=${encodeURIComponent(item.name)}`;
   }
 
-  // listing: the single cheapest listing for this item currently at/below threshold.
-  // item: either a watchlist entry ({id, name, threshold}) or, from "check all", a
-  // synthetic {id, name, marketValue} — whichever is set decides how the alert reads.
+  // listing: the sell listing this alert is about (its price/seller drive the dedup key
+  // and the opened link either way).
+  // item: a watchlist entry ({id, name, threshold}), a "check all" market-value context
+  // ({id, name, marketValue}), or a flip-check context ({id, name, note}) — whichever
+  // field is set decides the alert's wording; `note`, if present, wins outright.
   // opts.autoOpen (default true) lets a caller suppress the auto-open-tab toggle for
   // this specific alert, without touching the toggle itself — "check all" uses this so
   // a bulk scan can't pop dozens of tabs.
+  // opts.dedupTag distinguishes multiple *kinds* of alert that could otherwise fire for
+  // the exact same listing (e.g. "below market" and "profitable flip" at once) — without
+  // it they'd share a dedup key and the second would be silently swallowed.
   function notify(item, listing, opts = {}) {
-    const { autoOpen = true } = opts;
+    const { autoOpen = true, dedupTag = '' } = opts;
     const seen = loadSeenAlerts();
-    const key = `${item.id}-${listing.sellerUrl || 'x'}-${listing.price}`;
+    const key = `${item.id}-${listing.sellerUrl || 'x'}-${listing.price}${dedupTag ? '-' + dedupTag : ''}`;
     if (seen[key]) return;
     seen[key] = Date.now();
     GM_setValue(LS.seenAlerts, seen);
 
     const link = buildAlertLink(item, listing.sellerUrl);
-    const belowText = item.marketValue
+    const belowText = item.note
+      ? item.note
+      : item.marketValue
       ? `${Math.round((1 - listing.price / item.marketValue) * 100)}% below market $${item.marketValue.toLocaleString()}`
       : `below $${item.threshold.toLocaleString()}`;
 
     GM_notification({
       title: `Weav3r: ${item.name} deal!`,
-      text: `$${listing.price.toLocaleString()} (${belowText})${listing.seller ? ' — ' + listing.seller : ''}`,
+      text: `$${listing.price.toLocaleString()} ×${listing.quantity} (${belowText})${listing.seller ? ' — ' + listing.seller : ''}`,
       timeout: 25000,
       onclick: () => {
         window.focus();
@@ -299,7 +380,7 @@
     const payload = {
       embeds: [{
         title: `${item.name} deal!`,
-        description: `$${listing.price.toLocaleString()} (${belowText})${listing.seller ? `\nSeller: ${listing.seller}` : ''}`,
+        description: `$${listing.price.toLocaleString()} ×${listing.quantity} (${belowText})${listing.seller ? `\nSeller: ${listing.seller}` : ''}`,
         url: buildAlertLink(item, listing.sellerUrl),
         color: 0x3ddc84,
         timestamp: new Date().toISOString(),
@@ -483,6 +564,18 @@
       el('button', { id: 'w3b-check-all', style: btnStyle() }, 'Check all')
     );
 
+    const flushiesRow = el('div', { style: { display: 'flex', gap: '4px', marginTop: '6px', alignItems: 'center' } },
+      el('span', {}, 'Plushies & flowers'),
+      el('button', { id: 'w3b-check-flushies', style: { ...btnStyle(), marginLeft: 'auto' } }, 'Check Flushies')
+    );
+
+    const flushiesAutoCheckboxAttrs = { id: 'w3b-flushies-auto', type: 'checkbox', style: { cursor: 'pointer' } };
+    if (getFlushiesAutoScan()) flushiesAutoCheckboxAttrs.checked = 'checked';
+    const flushiesAutoRow = el('div', { style: { display: 'flex', gap: '6px', marginTop: '6px', alignItems: 'center' } },
+      el('input', flushiesAutoCheckboxAttrs),
+      el('label', { for: 'w3b-flushies-auto', style: 'cursor:pointer' }, 'Auto-scan flushies (2%+, >25 qty) — uses Auto-open tab toggle above')
+    );
+
     const status = el('div', { id: 'w3b-status', style: { marginTop: '6px', opacity: '.7' } }, 'Idle');
 
     // input rows/status styling
@@ -496,6 +589,8 @@
     body.appendChild(autoOpenRow);
     body.appendChild(discordRow);
     body.appendChild(checkAllRow);
+    body.appendChild(flushiesRow);
+    body.appendChild(flushiesAutoRow);
     body.appendChild(status);
 
     panel.appendChild(header);
@@ -563,6 +658,15 @@
     });
 
     checkAllRow.querySelector('#w3b-check-all').addEventListener('click', (e) => checkAll(e.target));
+
+    flushiesRow.querySelector('#w3b-check-flushies').addEventListener('click', (e) => checkFlushies(e.target));
+
+    flushiesAutoRow.querySelector('#w3b-flushies-auto').addEventListener('change', (e) => {
+      GM_setValue(LS.flushiesAutoScan, e.target.checked);
+      if (e.target.checked && !getTornApiKey()) {
+        setStatus('Auto-scan flushies is on, but needs a Torn API key first.');
+      }
+    });
 
     renderRows();
   }
@@ -705,20 +809,159 @@
   //  CHECK ALL — one-off scan of every tradeable item, market-price-relative
   // ════════════════════════════════════════════════════════════
 
-  let checkAllRunning = false;
+  // shared by every bulk scan (check-all, check-flushies) so they can't run concurrently
+  // and compound load on weav3r
+  let bulkScanRunning = false;
+
+  function checkMarketValueDeal(entry, cheapestSell) {
+    if (cheapestSell.price <= entry.marketValue * CONFIG.checkAllDiscountFactor) {
+      notify({ id: entry.id, name: entry.name, marketValue: entry.marketValue }, cheapestSell, { autoOpen: false, dedupTag: 'market' });
+      return true;
+    }
+    return false;
+  }
+
+  // The per-unit gap and the bulk-flip-profit checks are two different lenses on the
+  // same opportunity (and at quantity 1 they're mathematically the same number), so this
+  // fires at most one notify() covering whichever condition(s) matched — never two
+  // separate alerts for one listing. Returns 1 if it fired, 0 otherwise.
+  function checkFlipDeals(entry, cheapestSell, bestBuy) {
+    const perUnitProfit = bestBuy.price - cheapestSell.price;
+    const flipQty = cheapestSell.quantity;
+    const totalCost = cheapestSell.price * flipQty;
+    const totalProfit = perUnitProfit * flipQty;
+
+    const gapHit = perUnitProfit >= CONFIG.flipMinPriceGap;
+    const flipHit = flipQty > 0 && totalProfit >= CONFIG.flipMinTotalProfit && totalProfit / totalCost >= CONFIG.flipMinProfitRatio;
+    if (!gapHit && !flipHit) return 0;
+
+    const bulkPart = flipQty > 1 ? `, ${flipQty}x = +$${totalProfit.toLocaleString()}` : '';
+    const note = `buy $${cheapestSell.price.toLocaleString()} → sell $${bestBuy.price.toLocaleString()} (+$${perUnitProfit.toLocaleString()}/unit${bulkPart})`;
+    notify({ id: entry.id, name: entry.name, note }, cheapestSell, { autoOpen: false, dedupTag: 'flip' });
+    return 1;
+  }
 
   async function checkAll(button) {
-    if (checkAllRunning) return;
+    if (bulkScanRunning) {
+      setStatus('A scan is already running — wait for it to finish.');
+      return;
+    }
 
     let catalogue;
     try {
-      catalogue = await fetchAllItemsCatalog();
+      const full = await fetchAllItemsCatalog();
+      catalogue = full.filter((i) => i.marketValue > CONFIG.checkAllMinMarketValue && i.marketValue < CONFIG.checkAllMaxMarketValue);
     } catch (e) {
       setStatus(e.message === 'no_api_key' ? 'Enter a Torn API key first.' : `Check-all failed: ${e.message}`);
       return;
     }
 
-    checkAllRunning = true;
+    bulkScanRunning = true;
+    button.disabled = true;
+    const originalLabel = button.textContent;
+    button.textContent = 'Checking...';
+
+    let hits = 0;
+    // items with a real sell listing, carried over into the slower flip-check phase
+    const flipCandidates = [];
+
+    try {
+      // Phase 1: market-value check. Batched and fast — weav3r has never rate-limited
+      // the listings endpoint the way it does the deal-search one below.
+      for (let i = 0; i < catalogue.length; i += CONFIG.checkAllBatchSize) {
+        const batch = catalogue.slice(i, i + CONFIG.checkAllBatchSize);
+        setStatus(`Check all (1/2 — market value): ${Math.min(i + batch.length, catalogue.length)}/${catalogue.length} items (${hits} deal(s) so far)...`);
+        await Promise.all(batch.map(async (entry) => {
+          let sell;
+          try {
+            sell = await fetchWeav3rListings(entry.id);
+          } catch (e) {
+            console.warn(`[W3B] check-all: failed to fetch listings for item ${entry.id} (${entry.name}):`, e.message);
+            return;
+          }
+          const cheapestSell = sell.listings[0];
+          if (!cheapestSell) return;
+          if (checkMarketValueDeal(entry, cheapestSell)) hits++;
+          flipCandidates.push({ entry, cheapestSell });
+        }));
+        await sleep(CONFIG.checkAllBatchPauseMs);
+      }
+
+      // Phase 2: gap/flip check via trader buy prices. One at a time, deliberately
+      // slow, with a real backoff on 429 — weav3r's deal-search endpoint has a much
+      // tighter rate limit ("Too many deal searches. Please slow down.", confirmed
+      // live) than anything else this script talks to.
+      let flipBackoffUntil = 0;
+      for (let i = 0; i < flipCandidates.length; i++) {
+        const { entry, cheapestSell } = flipCandidates[i];
+        setStatus(`Check all (2/2 — flips, slow by design): ${i + 1}/${flipCandidates.length} items (${hits} deal(s) so far)...`);
+
+        if (Date.now() < flipBackoffUntil) {
+          await sleep(flipBackoffUntil - Date.now());
+        }
+        try {
+          const { traders } = await fetchWeav3rTraders(entry.id);
+          if (traders[0]) hits += checkFlipDeals(entry, cheapestSell, traders[0]);
+        } catch (e) {
+          if (e.message === 'rate_limited') {
+            flipBackoffUntil = Date.now() + CONFIG.flipCheckBackoffMs;
+            console.warn(`[W3B] check-all: deal-search rate-limited — pausing ${CONFIG.flipCheckBackoffMs / 1000}s`);
+          } else {
+            console.warn(`[W3B] check-all: failed to fetch traders for item ${entry.id} (${entry.name}):`, e.message);
+          }
+        }
+        await sleep(CONFIG.flipCheckPaceMs);
+      }
+
+      setStatus(`Check all done — ${hits} deal(s) found across ${catalogue.length} items.`);
+    } finally {
+      bulkScanRunning = false;
+      button.disabled = false;
+      button.textContent = originalLabel;
+    }
+  }
+
+  // Unlike checkMarketValueDeal (cheapest listing only), this pings every qualifying
+  // bazaar for the item, per the ask — with a 1% bar there can genuinely be several
+  // worth seeing, not just the single best one.
+  async function checkFlushiesOneItem(entry) {
+    let sell;
+    try {
+      sell = await fetchWeav3rListings(entry.id);
+    } catch (e) {
+      console.warn(`[W3B] check-flushies: failed to fetch listings for item ${entry.id} (${entry.name}):`, e.message);
+      return 0;
+    }
+    const threshold = entry.marketValue * CONFIG.flushiesDiscountFactor;
+    const qualifying = sell.listings.filter((l) => l.price <= threshold);
+    for (const listing of qualifying) {
+      notify({ id: entry.id, name: entry.name, marketValue: entry.marketValue }, listing, { autoOpen: false, dedupTag: 'flushie' });
+    }
+    return qualifying.length;
+  }
+
+  // Scans every Plushie and Flower above $1k market value (skips the handful of
+  // near-worthless ones, e.g. Teddy Bear/Sheep/Kitten Plushies at ~$500) for any bazaar
+  // at least 1% below market — a much lower bar than check-all's 20%, and unlike it,
+  // pings every qualifying listing rather than just the cheapest. A small category (a
+  // few dozen items total) so, unlike check-all's flip phase, there's no need for slow
+  // pacing: it only uses the listings endpoint, which weav3r has never rate-limited.
+  async function checkFlushies(button) {
+    if (bulkScanRunning) {
+      setStatus('A scan is already running — wait for it to finish.');
+      return;
+    }
+
+    let catalogue;
+    try {
+      const full = await fetchAllItemsCatalog();
+      catalogue = full.filter((i) => (i.type === 'Plushie' || i.type === 'Flower') && i.marketValue > CONFIG.flushiesMinMarketValue);
+    } catch (e) {
+      setStatus(e.message === 'no_api_key' ? 'Enter a Torn API key first.' : `Check-flushies failed: ${e.message}`);
+      return;
+    }
+
+    bulkScanRunning = true;
     button.disabled = true;
     const originalLabel = button.textContent;
     button.textContent = 'Checking...';
@@ -727,26 +970,63 @@
     try {
       for (let i = 0; i < catalogue.length; i += CONFIG.checkAllBatchSize) {
         const batch = catalogue.slice(i, i + CONFIG.checkAllBatchSize);
-        setStatus(`Check all: ${Math.min(i + batch.length, catalogue.length)}/${catalogue.length} items (${hits} deal(s) so far)...`);
-        await Promise.all(batch.map(async (entry) => {
-          try {
-            const { listings } = await fetchWeav3rListings(entry.id);
-            const cheapest = listings[0];
-            if (cheapest && cheapest.price <= entry.marketValue * CONFIG.checkAllDiscountFactor) {
-              notify({ id: entry.id, name: entry.name, marketValue: entry.marketValue }, cheapest, { autoOpen: false });
-              hits++;
-            }
-          } catch (e) {
-            console.warn(`[W3B] check-all: failed to fetch item ${entry.id} (${entry.name}):`, e.message);
-          }
-        }));
+        setStatus(`Check flushies: ${Math.min(i + batch.length, catalogue.length)}/${catalogue.length} items (${hits} deal(s) so far)...`);
+        const results = await Promise.all(batch.map(checkFlushiesOneItem));
+        hits += results.reduce((sum, n) => sum + n, 0);
         await sleep(CONFIG.checkAllBatchPauseMs);
       }
-      setStatus(`Check all done — ${hits} deal(s) found across ${catalogue.length} items.`);
+      setStatus(`Check flushies done — ${hits} deal(s) found across ${catalogue.length} plushies/flowers.`);
     } finally {
-      checkAllRunning = false;
+      bulkScanRunning = false;
       button.disabled = false;
       button.textContent = originalLabel;
+    }
+  }
+
+  // Stricter than the manual scan (2% under market, >25 qty vs. 1% under, any qty) and,
+  // unlike it, doesn't force autoOpen:false — it defers to the Auto-open tab toggle like
+  // the regular watchlist does, so turning that off also silences this. Shares the
+  // 'flushie' dedup tag with the manual scan deliberately: whichever catches a listing
+  // first, the other shouldn't re-alert on the same unchanged deal.
+  async function checkFlushiesAutoOneItem(entry) {
+    let sell;
+    try {
+      sell = await fetchWeav3rListings(entry.id);
+    } catch (e) {
+      console.warn(`[W3B] flushies auto-scan: failed to fetch listings for item ${entry.id} (${entry.name}):`, e.message);
+      return;
+    }
+    const threshold = entry.marketValue * CONFIG.flushiesAutoDiscountFactor;
+    for (const listing of sell.listings) {
+      if (listing.price <= threshold && listing.quantity > CONFIG.flushiesAutoMinQuantity) {
+        notify({ id: entry.id, name: entry.name, marketValue: entry.marketValue }, listing, { dedupTag: 'flushie' });
+      }
+    }
+  }
+
+  async function flushiesAutoTick() {
+    if (!getFlushiesAutoScan()) return;
+    if (!getTornApiKey()) return; // silently idle without a key — no point warning every cycle
+    if (bulkScanRunning) return; // don't compete with a manual check-all/check-flushies run
+    if (!claimLock()) return;
+
+    let catalogue;
+    try {
+      const full = await fetchAllItemsCatalog();
+      catalogue = full.filter((i) => (i.type === 'Plushie' || i.type === 'Flower') && i.marketValue > CONFIG.flushiesMinMarketValue);
+    } catch (e) {
+      console.warn('[W3B] flushies auto-scan: failed to fetch catalogue:', e.message);
+      return;
+    }
+    // small category (a few dozen items) — fine to check all concurrently each tick,
+    // same as the regular watchlist does with its handful of items
+    await Promise.all(catalogue.map(checkFlushiesAutoOneItem));
+  }
+
+  async function flushiesAutoLoop() {
+    while (true) {
+      await flushiesAutoTick();
+      await sleep(CONFIG.flushiesAutoScanIntervalMs);
     }
   }
 
@@ -761,5 +1041,6 @@
       buildPanel();
     }
     loop();
+    flushiesAutoLoop();
   }
 })();
