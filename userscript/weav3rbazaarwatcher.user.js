@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Weav3r Item Watcher
 // @namespace    weav3r-item-watch
-// @version      2.2
-// @description  Background-polls weav3r.dev item pages for buy-mode listings and alerts (desktop notification + optional Discord webhook + optional auto-opened tab that highlights the item on the seller's bazaar page) when the cheapest listing drops below a per-item threshold. Floating panel (bottom-left) lets you add/edit/remove watched item IDs and thresholds.
+// @version      2.4
+// @description  Background-polls weav3r.dev item pages for buy-mode listings and alerts (desktop notification + optional Discord webhook + optional auto-opened tab that highlights the item on the seller's bazaar page) when the cheapest listing drops below a per-item threshold. Also has a "Check all" button that scans every tradeable item above $10k market value (via the Torn API) for bazaar listings 20% or more below market price. Floating panel (bottom-left) lets you add/edit/remove watched item IDs and thresholds.
 // @match        https://weav3r.dev/*
 // @match        https://www.torn.com/bazaar.php*
 // @grant        GM_xmlhttpRequest
@@ -13,6 +13,7 @@
 // @downloadURL  https://github.com/Rqez/torn/blob/main/userscript/weav3rbazaarwatcher.user.js
 // @updateURL    https://github.com/Rqez/torn/blob/main/userscript/weav3rbazaarwatcher.user.js
 // @connect      weav3r.dev
+// @connect      api.torn.com
 // @connect      discord.com
 // @run-at       document-idle
 // ==/UserScript==
@@ -28,6 +29,10 @@
     defaultPollIntervalSec: 1,
     realertCooldownMs: 15 * 60_000, // don't re-notify the same item again within this window while it stays cheap
     lockTtlMultiplier: 2,           // a leader that's gone quiet this long (x poll interval) is assumed dead
+    checkAllDiscountFactor: 0.8,    // "check all" flags listings at/below 80% of market value (20% under)
+    checkAllMinMarketValue: 10_000, // skip items cheaper than this — not worth the scan time
+    checkAllBatchSize: 5,           // items fetched concurrently per batch during a "check all" scan
+    checkAllBatchPauseMs: 500,      // gap between batches — a full scan is hundreds of items, pace it gently
   };
 
   const DEFAULT_WATCHLIST = [
@@ -44,6 +49,7 @@
     panelPos: 'w3b_panel_pos',
     discordWebhook: 'w3b_discord_webhook',
     autoOpenTab: 'w3b_auto_open_tab',
+    tornApiKey: 'w3b_torn_api_key',
   };
 
   const TAB_ID = Math.random().toString(36).slice(2, 10);
@@ -95,6 +101,14 @@
 
   function getAutoOpenTab() {
     return GM_getValue(LS.autoOpenTab, false);
+  }
+
+  function getTornApiKey() {
+    return GM_getValue(LS.tornApiKey, '');
+  }
+
+  function saveTornApiKey(key) {
+    GM_setValue(LS.tornApiKey, key.trim());
   }
 
   // ════════════════════════════════════════════════════════════
@@ -162,6 +176,38 @@
     return { name, listings };
   }
 
+  // Torn's own official API — the only place a "market price for every item" list
+  // exists (weav3r only gives per-item bazaar listings, not a catalogue). Cached in
+  // memory for the page session since the item catalogue barely changes and there's
+  // no reason to re-fetch it on every "Check all" click.
+  let itemsCatalogueCache = null;
+  async function fetchAllItemsCatalog() {
+    if (itemsCatalogueCache) return itemsCatalogueCache;
+    const key = getTornApiKey();
+    if (!key) throw new Error('no_api_key');
+
+    const res = await gmGet(`https://api.torn.com/torn/?selections=items&key=${encodeURIComponent(key)}`);
+    if (res.status < 200 || res.status >= 300) {
+      throw new Error(`HTTP ${res.status}`);
+    }
+    let data;
+    try {
+      data = JSON.parse(res.responseText);
+    } catch {
+      throw new Error('bad_json');
+    }
+    if (data.error) {
+      throw new Error(`Torn API: ${data.error.error || data.error.code}`);
+    }
+
+    const catalogue = Object.entries(data.items || {})
+      .map(([id, info]) => ({ id: Number(id), name: info.name, marketValue: info.market_value }))
+      .filter((i) => Number.isFinite(i.marketValue) && i.marketValue > CONFIG.checkAllMinMarketValue);
+
+    itemsCatalogueCache = catalogue;
+    return catalogue;
+  }
+
   // ════════════════════════════════════════════════════════════
   //  ALERTS
   // ════════════════════════════════════════════════════════════
@@ -191,7 +237,13 @@
   }
 
   // listing: the single cheapest listing for this item currently at/below threshold.
-  function notify(item, listing) {
+  // item: either a watchlist entry ({id, name, threshold}) or, from "check all", a
+  // synthetic {id, name, marketValue} — whichever is set decides how the alert reads.
+  // opts.autoOpen (default true) lets a caller suppress the auto-open-tab toggle for
+  // this specific alert, without touching the toggle itself — "check all" uses this so
+  // a bulk scan can't pop dozens of tabs.
+  function notify(item, listing, opts = {}) {
+    const { autoOpen = true } = opts;
     const seen = loadSeenAlerts();
     const key = `${item.id}-${listing.sellerUrl || 'x'}-${listing.price}`;
     if (seen[key]) return;
@@ -199,17 +251,20 @@
     GM_setValue(LS.seenAlerts, seen);
 
     const link = buildAlertLink(item, listing.sellerUrl);
+    const belowText = item.marketValue
+      ? `${Math.round((1 - listing.price / item.marketValue) * 100)}% below market $${item.marketValue.toLocaleString()}`
+      : `below $${item.threshold.toLocaleString()}`;
 
     GM_notification({
       title: `Weav3r: ${item.name} deal!`,
-      text: `$${listing.price.toLocaleString()} (below $${item.threshold.toLocaleString()})${listing.seller ? ' — ' + listing.seller : ''}`,
+      text: `$${listing.price.toLocaleString()} (${belowText})${listing.seller ? ' — ' + listing.seller : ''}`,
       timeout: 25000,
       onclick: () => {
         window.focus();
         window.open(link, '_blank');
       },
     });
-    if (getAutoOpenTab()) {
+    if (autoOpen && getAutoOpenTab()) {
       // window.open() from a background poll isn't a user gesture and gets popup-blocked;
       // GM_openInTab is the extension-privileged equivalent of clicking the notification.
       if (listing.sellerUrl) {
@@ -234,17 +289,17 @@
       osc.start();
       osc.stop(ctx.currentTime + 0.4);
     } catch {}
-    sendDiscordAlert(item, listing);
-    console.log(`[W3B] ALERT: ${item.name} (${item.id}) $${listing.price.toLocaleString()}`);
+    sendDiscordAlert(item, listing, belowText);
+    console.log(`[W3B] ALERT: ${item.name} (${item.id}) $${listing.price.toLocaleString()} (${belowText})`);
   }
 
-  function sendDiscordAlert(item, listing) {
+  function sendDiscordAlert(item, listing, belowText) {
     const webhook = getDiscordWebhook();
     if (!webhook) return;
     const payload = {
       embeds: [{
         title: `${item.name} deal!`,
-        description: `$${listing.price.toLocaleString()} (below $${item.threshold.toLocaleString()})${listing.seller ? `\nSeller: ${listing.seller}` : ''}`,
+        description: `$${listing.price.toLocaleString()} (${belowText})${listing.seller ? `\nSeller: ${listing.seller}` : ''}`,
         url: buildAlertLink(item, listing.sellerUrl),
         color: 0x3ddc84,
         timestamp: new Date().toISOString(),
@@ -423,10 +478,15 @@
       el('button', { id: 'w3b-discord-test', style: btnStyle() }, 'Test')
     );
 
+    const checkAllRow = el('div', { style: { display: 'flex', gap: '4px', marginTop: '6px', alignItems: 'center' } },
+      el('input', { id: 'w3b-torn-key', type: 'password', placeholder: 'Torn API key (public)', style: 'flex:1;min-width:0', value: getTornApiKey() }),
+      el('button', { id: 'w3b-check-all', style: btnStyle() }, 'Check all')
+    );
+
     const status = el('div', { id: 'w3b-status', style: { marginTop: '6px', opacity: '.7' } }, 'Idle');
 
     // input rows/status styling
-    Array.from([addRow, intervalRow, discordRow]).forEach((row) => {
+    Array.from([addRow, intervalRow, discordRow, checkAllRow]).forEach((row) => {
       row.querySelectorAll('input').forEach((i) => Object.assign(i.style, inputStyle()));
     });
 
@@ -435,6 +495,7 @@
     body.appendChild(intervalRow);
     body.appendChild(autoOpenRow);
     body.appendChild(discordRow);
+    body.appendChild(checkAllRow);
     body.appendChild(status);
 
     panel.appendChild(header);
@@ -495,6 +556,13 @@
         onerror: () => setStatus('Discord test failed (network error).'),
       });
     });
+
+    checkAllRow.querySelector('#w3b-torn-key').addEventListener('change', (e) => {
+      saveTornApiKey(e.target.value);
+      itemsCatalogueCache = null; // key changed — drop the cache so the next scan re-fetches with it
+    });
+
+    checkAllRow.querySelector('#w3b-check-all').addEventListener('click', (e) => checkAll(e.target));
 
     renderRows();
   }
@@ -630,6 +698,55 @@
     while (true) {
       await pollAll(false);
       await sleep(getPollIntervalSec() * 1000);
+    }
+  }
+
+  // ════════════════════════════════════════════════════════════
+  //  CHECK ALL — one-off scan of every tradeable item, market-price-relative
+  // ════════════════════════════════════════════════════════════
+
+  let checkAllRunning = false;
+
+  async function checkAll(button) {
+    if (checkAllRunning) return;
+
+    let catalogue;
+    try {
+      catalogue = await fetchAllItemsCatalog();
+    } catch (e) {
+      setStatus(e.message === 'no_api_key' ? 'Enter a Torn API key first.' : `Check-all failed: ${e.message}`);
+      return;
+    }
+
+    checkAllRunning = true;
+    button.disabled = true;
+    const originalLabel = button.textContent;
+    button.textContent = 'Checking...';
+
+    let hits = 0;
+    try {
+      for (let i = 0; i < catalogue.length; i += CONFIG.checkAllBatchSize) {
+        const batch = catalogue.slice(i, i + CONFIG.checkAllBatchSize);
+        setStatus(`Check all: ${Math.min(i + batch.length, catalogue.length)}/${catalogue.length} items (${hits} deal(s) so far)...`);
+        await Promise.all(batch.map(async (entry) => {
+          try {
+            const { listings } = await fetchWeav3rListings(entry.id);
+            const cheapest = listings[0];
+            if (cheapest && cheapest.price <= entry.marketValue * CONFIG.checkAllDiscountFactor) {
+              notify({ id: entry.id, name: entry.name, marketValue: entry.marketValue }, cheapest, { autoOpen: false });
+              hits++;
+            }
+          } catch (e) {
+            console.warn(`[W3B] check-all: failed to fetch item ${entry.id} (${entry.name}):`, e.message);
+          }
+        }));
+        await sleep(CONFIG.checkAllBatchPauseMs);
+      }
+      setStatus(`Check all done — ${hits} deal(s) found across ${catalogue.length} items.`);
+    } finally {
+      checkAllRunning = false;
+      button.disabled = false;
+      button.textContent = originalLabel;
     }
   }
 
